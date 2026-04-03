@@ -673,12 +673,12 @@ def setup_result_path(run_name: str, conf_file: str, fast_dev_run: bool = False)
     now = datetime.datetime.now()
     while True:
         full_run_name = now.strftime("%Y%m%d_%H%M%S") + "_" + run_name
-        result_path = os.path.join(repo_dir, "results", full_run_name)
+        result_path = os.path.join(repo_dir, "results", "pointcloudFM", full_run_name)
         if not os.path.exists(result_path):
             if not fast_dev_run:
                 os.makedirs(result_path)
             else:
-                result_path = os.path.join(repo_dir, "results/test")
+                result_path = os.path.join(repo_dir, "results", "pointcloudFM", "test")
                 if os.path.exists(result_path):
                     shutil.rmtree(result_path)
                 os.makedirs(result_path)
@@ -734,7 +734,7 @@ def main(args: list | None = None) -> None:
         result_dir = config["result_path"]
     else:
         result_dir = setup_result_path(
-            config["name"], parsed_args.config, parsed_args.fast_dev_run
+            config["run_name"], parsed_args.config, parsed_args.fast_dev_run
         )
     num_new_samples = config["training"].get("num_new_samples", 50_000)
     if parsed_args.fast_dev_run:
