@@ -103,6 +103,13 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
             "Without this flag, the original 3-feature mode (x, y, e) is used."
         ),
     )
+    parser.add_argument(
+        "--num-events", type=int, default=None,
+        help=(
+            "Number of events/showers to process. If not set, processes the "
+            "entire file. Use this for large files to limit memory and compute."
+        ),
+    )
 
     # ── Slurm submission mode ──────────────────────────────────────────────
     parser.add_argument(
@@ -140,6 +147,17 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Merge per-worker sidecar HDF5 files into the main data file. "
             "Runs automatically after array jobs complete."
+        ),
+    )
+
+    parser.add_argument(
+        "--preprocessed-dir", type=str, default=None,
+        help=(
+            "Path to directory with preprocessed .pt shard files "
+            "(created by preprocess_shards.py). When set, skips raw H5 "
+            "loading and transformation — reads already-transformed data "
+            "from shards, runs OT matching, and saves noise back into "
+            "the shard files."
         ),
     )
 
@@ -527,24 +545,30 @@ def process_full_file(
     data_shape: tuple[int, ...],
     pre_processor: PreProcessor,
     batch_size: int = 128,
+    num_events: int | None = None,
 ) -> None:
     """Original single-job path — saves with showerdata.save_target."""
     F = pre_processor.num_features
-    num_batches = -(-data_shape[0] // batch_size)
+    total_events = num_events if num_events is not None else data_shape[0]
+    num_batches = -(-total_events // batch_size)
     print_time("batch size:", batch_size)
+    print_time(f"total events: {total_events} (file has {data_shape[0]})")
     print_time("number of batches:", num_batches)
     print_time(f"num features: {F}  {'(x, y, e, t)' if F == 4 else '(x, y, e)'}")
     sys.stdout.flush()
 
     noise_matcher = NoiseMatcher(pre_processor)
-    noise = np.empty((data_shape[0], F, data_shape[1]), dtype=np.float32)
+    noise = np.empty((total_events, F, data_shape[1]), dtype=np.float32)
     print_time(f"NoiseMatcher initialized. (noise shape={noise.shape})")
     sys.stdout.flush()
 
     num_processes = n - 1 if (n := os.cpu_count()) else 1
     with multiprocessing.Pool(num_processes) as pool:
         for i, batch in enumerate(
-            pool.imap(noise_matcher, DataLoader(data_file, batch_size))
+            pool.imap(
+                noise_matcher,
+                DataLoader(data_file, batch_size, start=0, end=total_events),
+            )
         ):
             noise[i * batch_size : i * batch_size + len(batch)] = batch
 
@@ -714,6 +738,158 @@ def merge_sidecars(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Preprocessed-shards processing path
+# ══════════════════════════════════════════════════════════════════════════════
+
+def match_noise_batch(
+    points: npt.NDArray[np.float32],
+    mask: npt.NDArray[np.bool_],
+    layer: npt.NDArray[np.int64],
+    num_layers: int,
+    num_features: int,
+) -> npt.NDArray[np.float32]:
+    """Run OT noise matching on a batch of already-transformed data.
+
+    Parameters
+    ----------
+    points : [batch, F, max_points]
+    mask   : [batch, max_points]
+    layer  : [batch, max_points]
+
+    Returns
+    -------
+    noise  : [batch, F, max_points]
+    """
+    F = num_features
+    noise = np.random.randn(points.shape[0], F, points.shape[2])
+
+    for i in range(num_layers):
+        mask_local = np.expand_dims(np.logical_and(mask, layer == i), 1)
+        for j in range(len(points)):
+            points_j = (
+                points[j].T[mask_local[j].repeat(F).reshape(-1, F)]
+                .reshape(-1, F)
+            )
+            noise_j = (
+                noise[j].T[mask_local[j].repeat(F).reshape(-1, F)]
+                .reshape(-1, F)
+            )
+            if len(points_j) > 1:
+                N = len(points_j)
+                assert len(noise_j) == N
+
+                M = np.sqrt(
+                    np.sum(
+                        (points_j[:, None, :] - noise_j[None, :, :]) ** 2, axis=-1
+                    )
+                )
+                wa = np.ones(N) / N
+                wb = np.ones(N) / N
+                T = ot.emd(wa, wb, M, numItermax=1_000_000)
+                noise_j = N * (T @ noise_j)
+
+                noise[j].T[mask_local[j].repeat(F).reshape(-1, F)] = (
+                    noise_j.flatten()
+                )
+
+    noise[(~mask[:, None, :]).repeat(F, axis=1)] = 0.0
+    return noise.astype(np.float32, copy=False)
+
+
+class ShardNoiseMatcher:
+    """Callable wrapper for multiprocessing — takes pre-transformed batch tuple."""
+
+    def __init__(self, num_layers: int, num_features: int) -> None:
+        self.num_layers = num_layers
+        self.num_features = num_features
+
+    def __call__(
+        self,
+        batch: tuple[npt.NDArray, npt.NDArray, npt.NDArray],
+    ) -> npt.NDArray[np.float32]:
+        points, mask, layer = batch
+        return match_noise_batch(
+            points, mask, layer, self.num_layers, self.num_features,
+        )
+
+
+def _iter_shard_batches(
+    shard_path: str,
+    batch_size: int,
+) -> Iterator[tuple[npt.NDArray, npt.NDArray, npt.NDArray]]:
+    """Yield (points, mask, layer) batches from a single .pt shard."""
+    data = torch.load(shard_path, weights_only=False)
+    x = data["x"].numpy()           # [N, max_points, F]
+    mask = data["mask"].numpy()      # [N, max_points, 1]
+    layer = data["layer"].numpy()    # [N, max_points, 1]
+    n = len(x)
+
+    for s in range(0, n, batch_size):
+        e = min(s + batch_size, n)
+        yield (
+            x[s:e].transpose(0, 2, 1),     # → [batch, F, max_points]
+            mask[s:e].squeeze(-1),          # → [batch, max_points]
+            layer[s:e].squeeze(-1),         # → [batch, max_points]
+        )
+
+
+def process_shards(
+    preprocessed_dir: str,
+    prefix: str,
+    batch_size: int = 4,
+) -> None:
+    """Run OT matching on preprocessed .pt shards and save noise back."""
+    shard_files = sorted(
+        f for f in os.listdir(preprocessed_dir)
+        if f.startswith(prefix + "_") and f.endswith(".pt")
+    )
+    if not shard_files:
+        raise FileNotFoundError(
+            f"No shard files matching '{prefix}_*.pt' in {preprocessed_dir}"
+        )
+
+    first = torch.load(
+        os.path.join(preprocessed_dir, shard_files[0]), weights_only=False,
+    )
+    num_features = first["x"].shape[-1]
+    num_layers = int(first["layer"].max().item()) + 1
+    del first
+
+    print_time(f"Shards: {len(shard_files)} files ({prefix}_*.pt)")
+    print_time(f"num_features: {num_features}, num_layers: {num_layers}")
+    sys.stdout.flush()
+
+    noise_matcher = ShardNoiseMatcher(num_layers, num_features)
+    num_processes = max(1, (os.cpu_count() or 1) - 1)
+
+    for shard_file in shard_files:
+        shard_path = os.path.join(preprocessed_dir, shard_file)
+        print_time(f"Processing {shard_file}...")
+        sys.stdout.flush()
+
+        noise_parts = []
+        with multiprocessing.Pool(num_processes) as pool:
+            for batch_noise in pool.imap(
+                noise_matcher,
+                _iter_shard_batches(shard_path, batch_size),
+            ):
+                noise_parts.append(batch_noise.transpose(0, 2, 1))
+
+        noise = np.concatenate(noise_parts, axis=0)
+        noise_tensor = torch.from_numpy(noise)
+
+        data = torch.load(shard_path, weights_only=False)
+        data["noise"] = noise_tensor
+        torch.save(data, shard_path)
+
+        print_time(f"  Saved noise to {shard_file} ({len(noise)} events)")
+        sys.stdout.flush()
+
+    print_time("All shards processed.")
+    sys.stdout.flush()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Main
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -725,6 +901,28 @@ def main(args: list[str] | None = None):
     print_time("Parsed arguments:", parsed_args)
     sys.stdout.flush()
 
+    # ── 0. --preprocessed-dir: process .pt shards directly ──────────────
+    if parsed_args.preprocessed_dir is not None:
+        print_time(f"Mode: preprocessed shards from {parsed_args.preprocessed_dir}")
+        sys.stdout.flush()
+
+        for prefix in ("train", "val"):
+            shard_check = [
+                f for f in os.listdir(parsed_args.preprocessed_dir)
+                if f.startswith(prefix + "_") and f.endswith(".pt")
+            ]
+            if shard_check:
+                print_time(f"\n--- Processing {prefix} shards ---")
+                sys.stdout.flush()
+                process_shards(
+                    parsed_args.preprocessed_dir,
+                    prefix=prefix,
+                    batch_size=4,
+                )
+            else:
+                print_time(f"No {prefix} shards found, skipping.")
+        return
+
     # ── 1. --with-slurm: submit one big job and exit ───────────────────────
     if parsed_args.with_slurm:
         extra = []
@@ -733,13 +931,26 @@ def main(args: list[str] | None = None):
         submit_single_slurm_job(parsed_args.file, extra)
         return
 
+    # ── Resolve num_events for all paths ────────────────────────────────
+    with open(parsed_args.file) as f:
+        config = yaml.safe_load(f)
+    data_shape = showerdata.get_file_shape(config["data"]["path"])
+    num_showers = data_shape[0]
+
+    if parsed_args.num_events is not None:
+        if parsed_args.num_events > num_showers:
+            print_time(
+                f"WARNING: --num-events {parsed_args.num_events} exceeds file size "
+                f"{num_showers}, clamping."
+            )
+        num_showers = min(parsed_args.num_events, num_showers)
+
+    print_time(f"Events in file: {data_shape[0]}")
+    print_time(f"Events to process: {num_showers}")
+    sys.stdout.flush()
+
     # ── 2. --heavy-files: submit array jobs + merge job, then exit ──────
     if parsed_args.heavy_files:
-        with open(parsed_args.file) as f:
-            config = yaml.safe_load(f)
-        data_shape = showerdata.get_file_shape(config["data"]["path"])
-        num_showers = data_shape[0]
-
         submit_array_slurm_jobs(
             config_file=parsed_args.file,
             num_showers=num_showers,
@@ -750,10 +961,6 @@ def main(args: list[str] | None = None):
 
     # ── 2b. --merge: combine sidecar files after array jobs ──────────────
     if parsed_args.merge:
-        with open(parsed_args.file) as f:
-            config = yaml.safe_load(f)
-        data_shape = showerdata.get_file_shape(config["data"]["path"])
-        num_showers = data_shape[0]
         F = 4 if parsed_args.with_time else 3
 
         merge_sidecars(
@@ -767,11 +974,6 @@ def main(args: list[str] | None = None):
 
     # ── 2c. --resubmit-failed: resubmit missing sidecar jobs ─────────────
     if parsed_args.resubmit_failed:
-        with open(parsed_args.file) as f:
-            config = yaml.safe_load(f)
-        data_shape = showerdata.get_file_shape(config["data"]["path"])
-        num_showers = data_shape[0]
-
         resubmit_failed_jobs(
             config_file=parsed_args.file,
             num_showers=num_showers,
@@ -818,6 +1020,7 @@ def main(args: list[str] | None = None):
         data_shape=pre_processor.data_shape,
         pre_processor=pre_processor,
         batch_size=4,
+        num_events=num_showers,
     )
 
 

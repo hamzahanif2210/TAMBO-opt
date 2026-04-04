@@ -1,3 +1,4 @@
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Iterator
 from typing import TypedDict
@@ -11,6 +12,8 @@ __all__ = [
     "DataLoader",
     "DictDataSet",
     "LazyH5DataSet",
+    "ShardedDataLoader",
+    "ShardedDataSet",
     "ModelInputDict",
 ]
 
@@ -104,6 +107,188 @@ class DictDataSet(DataSet):
                 data[key] = None
         result = ModelInputDict(**data)
         return result
+
+
+class ShardedDataSet(DataSet):
+    """Dataset backed by pre-transformed ``.pt`` shard files.
+
+    Only one shard is kept in memory at a time.  At the start of each
+    epoch the ``DataLoader`` calls ``__iter__`` which generates a fresh
+    permutation; batches that fall within the current shard are served
+    from RAM, and the shard is swapped when the next batch needs a
+    different one.
+
+    Because random global shuffling would require swapping shards on
+    every batch, this dataset uses a *shard-then-shuffle* strategy:
+
+    1. Shuffle the order of shards each epoch.
+    2. Within each shard, shuffle the sample order.
+
+    This gives good randomness while keeping I/O sequential.
+    """
+
+    def __init__(self, shard_dir: str, prefix: str) -> None:
+        self.shard_dir = shard_dir
+        self.prefix = prefix
+
+        # Discover shard files
+        self.shard_files: list[str] = sorted(
+            f
+            for f in os.listdir(shard_dir)
+            if f.startswith(prefix + "_") and f.endswith(".pt")
+        )
+        if not self.shard_files:
+            raise FileNotFoundError(
+                f"No shard files matching '{prefix}_*.pt' in {shard_dir}"
+            )
+
+        # Compute total length and per-shard lengths
+        self.shard_lengths: list[int] = []
+        for sf in self.shard_files:
+            data = torch.load(os.path.join(shard_dir, sf), weights_only=False)
+            self.shard_lengths.append(len(data["x"]))
+            del data
+        self.total_length = sum(self.shard_lengths)
+
+        # Current loaded shard
+        self._loaded_shard_idx: int = -1
+        self._loaded_data: dict | None = None
+
+    def __len__(self) -> int:
+        return self.total_length
+
+    def _load_shard(self, shard_idx: int) -> dict:
+        if shard_idx != self._loaded_shard_idx:
+            # Free previous shard
+            self._loaded_data = None
+            path = os.path.join(self.shard_dir, self.shard_files[shard_idx])
+            self._loaded_data = torch.load(path, weights_only=False)
+            self._loaded_shard_idx = shard_idx
+        return self._loaded_data  # type: ignore[return-value]
+
+    def _global_to_shard(self, global_idx: int) -> tuple[int, int]:
+        """Map a global index to (shard_index, local_index)."""
+        offset = 0
+        for i, length in enumerate(self.shard_lengths):
+            if global_idx < offset + length:
+                return i, global_idx - offset
+            offset += length
+        raise IndexError(f"Index {global_idx} out of range [0, {self.total_length})")
+
+    def __getitem__(self, index: int | list[int] | torch.Tensor) -> ModelInputDict:
+        if isinstance(index, (int, np.integer)):
+            index = torch.tensor([index])
+        if isinstance(index, list):
+            index = torch.tensor(index)
+
+        # Group indices by shard for efficient loading
+        shard_indices: dict[int, list[tuple[int, int]]] = {}
+        for batch_pos, global_idx in enumerate(index.tolist()):
+            shard_idx, local_idx = self._global_to_shard(global_idx)
+            shard_indices.setdefault(shard_idx, []).append((batch_pos, local_idx))
+
+        batch_size = len(index)
+        result_parts: dict[str, list] = {}
+
+        # Allocate in shard order to minimise shard swaps
+        for shard_idx in sorted(shard_indices.keys()):
+            pairs = shard_indices[shard_idx]
+            data = self._load_shard(shard_idx)
+            local_idxs = torch.tensor([p[1] for p in pairs])
+            batch_positions = [p[0] for p in pairs]
+
+            for key, value in data.items():
+                if key not in result_parts:
+                    result_parts[key] = [None] * batch_size
+                if isinstance(value, torch.Tensor):
+                    sliced = value[local_idxs]
+                    for bp, row in zip(batch_positions, sliced):
+                        result_parts[key][bp] = row
+                else:
+                    # None (e.g. noise)
+                    for bp in batch_positions:
+                        result_parts[key][bp] = value
+
+        # Stack into tensors
+        out: dict = {}
+        for key, parts in result_parts.items():
+            if parts[0] is None:
+                out[key] = None
+            else:
+                out[key] = torch.stack(parts)
+        return ModelInputDict(**out)
+
+
+class ShardedDataLoader(Iterable[ModelInputDict]):
+    """DataLoader optimised for ``ShardedDataSet``.
+
+    Instead of globally shuffling indices (which causes thrashing between
+    shards), this loader:
+
+    1. Shuffles the **shard order** each epoch.
+    2. Loads one shard at a time into a ``DictDataSet``.
+    3. Shuffles **within** that shard and yields batches.
+
+    This means each shard is loaded exactly once per epoch, and the only
+    RAM used is one shard at a time.
+    """
+
+    def __init__(
+        self,
+        data_set: ShardedDataSet,
+        batch_size: int,
+        drop_last: bool = True,
+        shuffle: bool = True,
+    ) -> None:
+        self.data_set = data_set
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self.shuffle = shuffle
+
+        if self.drop_last:
+            self.max_batch = len(self.data_set) // self.batch_size
+        else:
+            self.max_batch = (
+                len(self.data_set) + self.batch_size - 1
+            ) // self.batch_size
+
+    def __len__(self) -> int:
+        return self.max_batch
+
+    def __iter__(self) -> Iterator[ModelInputDict]:
+        num_shards = len(self.data_set.shard_files)
+        if self.shuffle:
+            shard_order = torch.randperm(num_shards).tolist()
+        else:
+            shard_order = list(range(num_shards))
+
+        batches_yielded = 0
+        for shard_idx in shard_order:
+            shard_data = self.data_set._load_shard(shard_idx)
+            shard_len = self.data_set.shard_lengths[shard_idx]
+
+            if self.shuffle:
+                perm = torch.randperm(shard_len)
+            else:
+                perm = torch.arange(shard_len)
+
+            for start in range(0, shard_len, self.batch_size):
+                end = min(start + self.batch_size, shard_len)
+                if self.drop_last and (end - start) < self.batch_size:
+                    continue
+                idx = perm[start:end]
+
+                batch: dict = {}
+                for key, value in shard_data.items():
+                    if isinstance(value, torch.Tensor):
+                        batch[key] = value[idx].clone().detach()
+                    else:
+                        batch[key] = None
+
+                yield ModelInputDict(**batch)
+                batches_yielded += 1
+
+        # Pad with partial shard data is already handled by drop_last
 
 
 class LazyH5DataSet(DataSet):
