@@ -147,8 +147,9 @@ class Trainer:
             flow_config = model_config.pop("flow_config")
         else:
             flow_config = {}
+        compile_model = bool(model_config.pop("compile", False))
         network = transformer.Transformer(**model_config)
-        if self.device.type == "cuda":
+        if self.device.type == "cuda" and compile_model:
             network = torch.compile(network)
         flow = flow_matching.CNF(network, **flow_config)  # type: ignore
         flow = flow.to(self.device)
