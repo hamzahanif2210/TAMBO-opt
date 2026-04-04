@@ -424,8 +424,11 @@ def _reconstruct_trafo(state_dict: dict) -> Transformation:
             return t
         return Identity()
 
+    # Keep original sub-module positions. Some stateless transforms
+    # (e.g. Log) do not contribute state_dict entries, which can create
+    # index gaps such as only ``sub_modules.1.*`` being present.
     modules: list[Transformation] = []
-    for i in sorted(indices):
+    for i in range(max(indices) + 1):
         prefix = f"sub_modules.{i}."
         sub_state = {
             k[len(prefix):]: v
@@ -435,7 +438,8 @@ def _reconstruct_trafo(state_dict: dict) -> Transformation:
         if "mean" in sub_state and "std" in sub_state:
             t = StandardScaler(shape=tuple(sub_state["mean"].shape))
         elif not sub_state:
-            # No parameters — likely Log or Identity
+            # Stateless module (commonly Log in this project).
+            # Use Log placeholder to preserve module index alignment.
             t = Log(alpha=0.0)
         else:
             t = Identity()
