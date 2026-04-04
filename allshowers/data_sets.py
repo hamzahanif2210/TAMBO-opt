@@ -1,3 +1,4 @@
+import copy
 import os
 import time
 import warnings
@@ -456,11 +457,11 @@ def get_data_loaders(
             )
 
         trafos = {
-            "samples_energy_trafo": se_trafo,
-            "samples_coordinate_trafo": sc_trafo,
-            "cond_trafo": c_trafo,
+            "samples_energy_trafo": copy.deepcopy(se_trafo),
+            "samples_coordinate_trafo": copy.deepcopy(sc_trafo),
+            "cond_trafo": copy.deepcopy(c_trafo),
             **({
-                "samples_time_trafo": st_trafo
+                "samples_time_trafo": copy.deepcopy(st_trafo)
             } if st_trafo is not None else {}),
         }
         return loader_train, loader_test, trafos
