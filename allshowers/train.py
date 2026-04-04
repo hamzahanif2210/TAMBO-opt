@@ -346,14 +346,46 @@ class Trainer:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         return path
 
-    def get_loss(self, batch: data_loader.ModelInputDict) -> torch.Tensor:
-        for key in batch:
-            if isinstance(batch[key], torch.Tensor):
-                batch[key] = batch[key].to(self.device)
+    def _compute_losses(self, batch: data_loader.ModelInputDict) -> torch.Tensor:
         losses = self.flow.loss(**batch)
         losses = losses * batch["mask"].to(losses.dtype)
         losses = torch.mean(losses, dim=(1, 2))
         return losses
+
+    def _slice_batch(
+        self,
+        batch: data_loader.ModelInputDict,
+        start: int,
+        end: int,
+    ) -> data_loader.ModelInputDict:
+        sliced: dict[str, torch.Tensor | None] = {}
+        for key, value in batch.items():
+            if isinstance(value, torch.Tensor):
+                sliced[key] = value[start:end]
+            else:
+                sliced[key] = value
+        return data_loader.ModelInputDict(**sliced)
+
+    def get_loss(self, batch: data_loader.ModelInputDict) -> torch.Tensor:
+        for key in batch:
+            if isinstance(batch[key], torch.Tensor):
+                batch[key] = batch[key].to(self.device)
+        try:
+            return self._compute_losses(batch)
+        except RuntimeError as e:
+            # Graceful OOM fallback for large batches on attention-heavy models.
+            if (
+                "out of memory" in str(e).lower()
+                and self.device.type == "cuda"
+                and isinstance(batch["x"], torch.Tensor)
+                and len(batch["x"]) > 1
+            ):
+                torch.cuda.empty_cache()
+                mid = len(batch["x"]) // 2
+                left = self.get_loss(self._slice_batch(batch, 0, mid))
+                right = self.get_loss(self._slice_batch(batch, mid, len(batch["x"])))
+                return torch.cat([left, right], dim=0)
+            raise
 
     def fit(self) -> None:
         for epoch in range(self.epoch + 1, self.num_epochs + 1):
