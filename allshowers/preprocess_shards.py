@@ -4,9 +4,13 @@ Usage
 -----
     python -m allshowers.preprocess_shards conf/allshowers_photons.yaml \\
         --output-dir /path/to/preprocessed_photons \\
+        --train-events 700000 \\
+        --val-events 30000 \\
         --shard-size 70000
 
-This produces:
+This reads the H5 file, lets you specify exactly how many events to use
+for training and validation, transforms them, and writes .pt shards:
+
     /path/to/preprocessed_photons/
         train_000.pt   # first 70k training samples (preprocessed)
         train_001.pt
@@ -51,7 +55,7 @@ def preprocess_chunk(
     max_num_points: int | None = None,
     num_layers: int = -1,
 ):
-    """Load a chunk from the H5 file and return preprocessed ModelInputDict tensors."""
+    """Load a chunk from the H5 file and return preprocessed tensors."""
     with_time = samples_time_trafo is not None
 
     data = load_data(
@@ -155,6 +159,14 @@ def main(args: list[str] | None = None) -> None:
         help="Directory to write preprocessed shards",
     )
     parser.add_argument(
+        "--train-events", type=int, required=True,
+        help="Number of events/showers to use for training",
+    )
+    parser.add_argument(
+        "--val-events", type=int, required=True,
+        help="Number of events/showers to use for validation",
+    )
+    parser.add_argument(
         "--shard-size", type=int, default=70_000,
         help="Number of samples per shard file (default: 70000)",
     )
@@ -181,20 +193,34 @@ def main(args: list[str] | None = None) -> None:
     return_direction = data_conf.get("return_direction", False)
     max_num_points = data_conf.get("max_num_points", None)
 
-    # --- Determine train/val split ---
-    data_len = showerdata.get_file_shape(path)[0]
-    if "stop" in data_conf:
-        data_len = min(data_len, data_conf["stop"])
-    val_len = data_conf.get("val_len", data_len // 10)
-    val_len = min(val_len, data_len // 2)
-    split = data_len - val_len
+    # --- Validate event counts against file ---
+    file_len = showerdata.get_file_shape(path)[0]
+    total_requested = parsed.train_events + parsed.val_events
 
-    print(f"Data file: {path}")
-    print(f"Total samples: {data_len}")
-    print(f"Train samples: {split}")
-    print(f"Val samples:   {val_len}")
-    print(f"Shard size:    {parsed.shard_size}")
-    print(f"Output dir:    {parsed.output_dir}")
+    print(f"Data file:        {path}")
+    print(f"Events in file:   {file_len}")
+    print(f"Train events:     {parsed.train_events}")
+    print(f"Val events:       {parsed.val_events}")
+    print(f"Total requested:  {total_requested}")
+    print(f"Shard size:       {parsed.shard_size}")
+    print(f"Output dir:       {parsed.output_dir}")
+    print()
+
+    if total_requested > file_len:
+        print(
+            f"ERROR: Requested {total_requested} events "
+            f"(train={parsed.train_events} + val={parsed.val_events}) "
+            f"but file only has {file_len} events."
+        )
+        sys.exit(1)
+
+    train_start = 0
+    train_stop = parsed.train_events
+    val_start = parsed.train_events
+    val_stop = parsed.train_events + parsed.val_events
+
+    print(f"Train range: [{train_start}, {train_stop})")
+    print(f"Val range:   [{val_start}, {val_stop})")
     print()
     sys.stdout.flush()
 
@@ -202,13 +228,14 @@ def main(args: list[str] | None = None) -> None:
     os.makedirs(parsed.output_dir, exist_ok=True)
     trafos_file = os.path.join(parsed.output_dir, "trafos.pt")
 
-    print("Fitting transformations...")
+    fit_stop = min(parsed.fit_samples, train_stop)
+    print(f"Fitting transformations on first {fit_stop} events...")
     sys.stdout.flush()
     with_time = st_trafo is not None
     fit_data = load_data(
         path,
         start=0,
-        stop=min(parsed.fit_samples, split),
+        stop=fit_stop,
         return_noise=False,
         max_num_points=max_num_points,
         with_time=with_time,
@@ -241,10 +268,11 @@ def main(args: list[str] | None = None) -> None:
     )
 
     # --- Write training shards ---
-    print("Writing training shards...")
+    print(f"Writing training shards ({parsed.train_events} events)...")
     sys.stdout.flush()
     train_shards = write_shards(
-        path, 0, split, parsed.output_dir, "train", parsed.shard_size,
+        path, train_start, train_stop,
+        parsed.output_dir, "train", parsed.shard_size,
         **common_kwargs,
     )
     print(f"Wrote {len(train_shards)} training shards")
@@ -252,10 +280,11 @@ def main(args: list[str] | None = None) -> None:
     sys.stdout.flush()
 
     # --- Write validation shards ---
-    print("Writing validation shards...")
+    print(f"Writing validation shards ({parsed.val_events} events)...")
     sys.stdout.flush()
     val_shards = write_shards(
-        path, split, data_len, parsed.output_dir, "val", parsed.shard_size,
+        path, val_start, val_stop,
+        parsed.output_dir, "val", parsed.shard_size,
         **common_kwargs,
     )
     print(f"Wrote {len(val_shards)} validation shards")
@@ -264,9 +293,9 @@ def main(args: list[str] | None = None) -> None:
 
     # --- Write metadata ---
     meta = {
-        "data_len": data_len,
-        "train_len": split,
-        "val_len": val_len,
+        "file_len": file_len,
+        "train_events": parsed.train_events,
+        "val_events": parsed.val_events,
         "shard_size": parsed.shard_size,
         "num_train_shards": len(train_shards),
         "num_val_shards": len(val_shards),
