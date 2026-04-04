@@ -8,7 +8,14 @@ import showerdata
 import torch
 from torch import Tensor
 
-from allshowers.data_loader import DataLoader, DictDataSet, LazyH5DataSet, ModelInputDict
+from allshowers.data_loader import (
+    DataLoader,
+    DictDataSet,
+    LazyH5DataSet,
+    ModelInputDict,
+    ShardedDataLoader,
+    ShardedDataSet,
+)
 from allshowers.preprocessing import Identity, Transformation, compose
 
 __all__ = ["create_label_list", "to_label_tensor", "get_data_loaders"]
@@ -331,6 +338,114 @@ def _build_label_map(path: str, data_len: int) -> dict[int, int]:
     return {int(v): i for i, v in enumerate(unique_pdg)}
 
 
+def _get_sharded_loaders(
+    preprocessed_dir: str,
+    batch_size: int,
+    trafos_file: str,
+) -> tuple[DataLoader, DataLoader, dict[str, Transformation]]:
+    """Build data loaders from pre-transformed .pt shard files.
+
+    Expected directory layout (created by ``preprocess_shards.py``)::
+
+        preprocessed_dir/
+            train_000.pt, train_001.pt, ...
+            val_000.pt, ...
+            trafos.pt
+            meta.pt
+    """
+    shard_trafos_file = os.path.join(preprocessed_dir, "trafos.pt")
+
+    # Load trafos — these are the fitted transformations used during
+    # preprocessing.  We return them so train.py / generator.py can use
+    # them for inverse transforms during generation.
+    trafos_state = torch.load(shard_trafos_file, weights_only=True)
+
+    trafos: dict[str, Transformation] = {}
+    for key, state in trafos_state.items():
+        # Reconstruct trafo module from its state_dict
+        # We need to know which compose() produced it; since the state
+        # dict is self-describing, we load into a fresh Sequence.
+        trafo = _reconstruct_trafo(state)
+        trafos[key] = trafo
+
+    # Also copy trafos to the result_path location so checkpointing is
+    # consistent with the non-sharded paths.
+    if trafos_file and not os.path.isfile(trafos_file):
+        import shutil
+        os.makedirs(os.path.dirname(trafos_file), exist_ok=True)
+        shutil.copy2(shard_trafos_file, trafos_file)
+
+    train_ds = ShardedDataSet(preprocessed_dir, "train")
+    val_ds = ShardedDataSet(preprocessed_dir, "val")
+
+    loader_train = ShardedDataLoader(
+        data_set=train_ds,
+        batch_size=batch_size,
+        drop_last=len(train_ds) > batch_size,
+        shuffle=True,
+    )
+    loader_test = ShardedDataLoader(
+        data_set=val_ds,
+        batch_size=batch_size,
+        drop_last=False,
+        shuffle=False,
+    )
+
+    return loader_train, loader_test, trafos  # type: ignore[return-value]
+
+
+def _reconstruct_trafo(state_dict: dict) -> Transformation:
+    """Rebuild a Transformation (Sequence) from its saved state_dict.
+
+    The state_dict keys follow the pattern ``sub_modules.{i}.{param}``
+    which tells us how many sub-modules there are and what buffers they
+    hold (mean/std → StandardScaler, otherwise → Log/Identity/etc).
+    """
+    from allshowers.preprocessing import (
+        Affine,
+        Log,
+        LogIt,
+        Sequence,
+        StandardScaler,
+    )
+
+    # Parse sub-module indices
+    indices: set[int] = set()
+    for key in state_dict:
+        parts = key.split(".")
+        if len(parts) >= 2 and parts[0] == "sub_modules":
+            indices.add(int(parts[1]))
+
+    if not indices:
+        # No sub-modules: it's a single transformation
+        if "mean" in state_dict and "std" in state_dict:
+            t = StandardScaler(shape=tuple(state_dict["mean"].shape))
+            t.load_state_dict(state_dict)
+            return t
+        return Identity()
+
+    modules: list[Transformation] = []
+    for i in sorted(indices):
+        prefix = f"sub_modules.{i}."
+        sub_state = {
+            k[len(prefix):]: v
+            for k, v in state_dict.items()
+            if k.startswith(prefix)
+        }
+        if "mean" in sub_state and "std" in sub_state:
+            t = StandardScaler(shape=tuple(sub_state["mean"].shape))
+        elif not sub_state:
+            # No parameters — likely Log or Identity
+            t = Log(alpha=0.0)
+        else:
+            t = Identity()
+        modules.append(t)
+
+    seq = Sequence(modules)
+    seq.load_state_dict(state_dict)
+    return seq
+
+
 def get_data_loaders(
     config_dataset: dict,
     batch_size: int,
@@ -340,6 +455,14 @@ def get_data_loaders(
     trafos_file: str = "",
 ) -> tuple[DataLoader, DataLoader, dict[str, Transformation]]:
     config_dataset = config_dataset.copy()
+
+    # ------------------------------------------------------------------
+    # Preprocessed-shards path: data already transformed & saved as .pt
+    # ------------------------------------------------------------------
+    preprocessed_dir = config_dataset.pop("preprocessed_dir", None)
+    if preprocessed_dir is not None:
+        return _get_sharded_loaders(preprocessed_dir, batch_size, trafos_file)
+
     lazy = config_dataset.pop("lazy", False)
     data_len = showerdata.get_file_shape(config_dataset["path"])[0]
     if "stop" in config_dataset:

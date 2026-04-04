@@ -2,6 +2,16 @@ run_name: Photon-Allshower
 
 
 data:
+  # Option 1: Use preprocessed .pt shards (fastest, run preprocess_shards.py first)
+  # preprocessed_dir: /path/to/preprocessed_photons
+  #
+  # Option 2: Lazy H5 loading (no extra disk, reads per-batch from H5)
+  # path: /n/.../combined_photons_balanced.h5
+  # lazy: true
+  #
+  # Option 3: In-memory (original, needs enough RAM for full dataset)
+  # path: /n/.../combined_photons_balanced.h5
+
   path: /n/holylfs05/LABS/arguelles_delgado_lab/Everyone/hhanif/tambo_simulations_for_training/combined_photons_balanced.h5
   lazy: true
   samples_energy_trafo:
