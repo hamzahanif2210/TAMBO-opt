@@ -7,7 +7,7 @@ import showerdata
 import torch
 from torch import Tensor
 
-from allshowers.data_loader import DataLoader, DictDataSet, ModelInputDict
+from allshowers.data_loader import DataLoader, DictDataSet, LazyH5DataSet, ModelInputDict
 from allshowers.preprocessing import Identity, Transformation, compose
 
 __all__ = ["create_label_list", "to_label_tensor", "get_data_loaders"]
@@ -277,6 +277,59 @@ def load_and_prepare(
     )
 
 
+def _init_trafos_from_sample(
+    path: str,
+    samples_energy_trafo: Transformation,
+    samples_coordinate_trafo: Transformation,
+    cond_trafo: Transformation,
+    samples_time_trafo: Transformation | None,
+    max_num_points: int | None,
+    trafos_file: str,
+    rank: int,
+    world_size: int,
+    local_rank: int,
+    fit_samples: int = 100_000,
+) -> None:
+    """Fit / load preprocessing transformations using a small sample.
+
+    For lazy loading we cannot materialise the whole dataset, so we read
+    just ``fit_samples`` rows from the beginning of the file.
+    """
+    with_time = samples_time_trafo is not None
+    data = load_data(
+        path,
+        start=0,
+        stop=fit_samples,
+        return_noise=False,
+        max_num_points=max_num_points,
+        with_time=with_time,
+    )
+    mask = data["shower"][:, :, [3]] > 0
+    initialise_trafos(
+        data["energy"],
+        data["shower"],
+        mask,
+        samples_energy_trafo,
+        samples_coordinate_trafo,
+        cond_trafo,
+        samples_time_trafo,
+        trafos_file=trafos_file,
+        rank=rank,
+        world_size=world_size,
+        local_rank=local_rank,
+    )
+
+
+def _build_label_map(path: str, data_len: int) -> dict[int, int]:
+    """Read pdg values and return a {pdg_value: label_index} mapping."""
+    import h5py as _h5py
+
+    with _h5py.File(path, "r") as f:
+        pdg = f["pdg"][:data_len]
+    unique_pdg = sorted(set(pdg.flat), key=lambda x: (abs(x), -x))
+    return {int(v): i for i, v in enumerate(unique_pdg)}
+
+
 def get_data_loaders(
     config_dataset: dict,
     batch_size: int,
@@ -286,6 +339,7 @@ def get_data_loaders(
     trafos_file: str = "",
 ) -> tuple[DataLoader, DataLoader, dict[str, Transformation]]:
     config_dataset = config_dataset.copy()
+    lazy = config_dataset.pop("lazy", False)
     data_len = showerdata.get_file_shape(config_dataset["path"])[0]
     if "stop" in config_dataset:
         data_len = min(data_len, config_dataset["stop"])
@@ -319,6 +373,99 @@ def get_data_loaders(
             config_dataset["samples_time_trafo"]
         )
 
+    if lazy:
+        # --- Lazy-loading path: read from H5 on the fly ---
+        path = config_dataset["path"]
+        return_noise = config_dataset.get("return_noise", False)
+        return_direction = config_dataset.get("return_direction", False)
+        max_num_points = config_dataset.get("max_num_points", None)
+        num_layers = config_dataset.get("num_layers", -1)
+
+        se_trafo = config_dataset.get("samples_energy_trafo", Identity())
+        sc_trafo = config_dataset.get("samples_coordinate_trafo", Identity())
+        c_trafo = config_dataset.get("cond_trafo", Identity())
+        st_trafo = config_dataset.get("samples_time_trafo", None)
+
+        # Fit / load trafos from a small sample
+        _init_trafos_from_sample(
+            path, se_trafo, sc_trafo, c_trafo, st_trafo,
+            max_num_points, trafos_file,
+            rank, world_size, local_rank,
+        )
+
+        # Build label map once (reads only the pdg column)
+        label_map = _build_label_map(path, data_len)
+
+        start = rank * (split // world_size)
+        stop = (rank + 1) * (split // world_size)
+
+        data_train = LazyH5DataSet(
+            path, start, stop,
+            label_map=label_map,
+            samples_energy_trafo=se_trafo,
+            samples_coordinate_trafo=sc_trafo,
+            cond_trafo=c_trafo,
+            samples_time_trafo=st_trafo,
+            return_noise=return_noise,
+            return_direction=return_direction,
+            max_num_points=max_num_points,
+            num_layers=num_layers,
+        )
+        loader_train = DataLoader(
+            data_set=data_train,
+            batch_size=batch_size,
+            drop_last=(stop - start) > batch_size,
+            shuffle=True,
+        )
+
+        if rank == 0:
+            data_test = LazyH5DataSet(
+                path, split, data_len,
+                label_map=label_map,
+                samples_energy_trafo=se_trafo,
+                samples_coordinate_trafo=sc_trafo,
+                cond_trafo=c_trafo,
+                samples_time_trafo=st_trafo,
+                return_noise=return_noise,
+                return_direction=return_direction,
+                max_num_points=max_num_points,
+                num_layers=num_layers,
+            )
+            loader_test = DataLoader(
+                data_set=data_test,
+                batch_size=batch_size,
+                drop_last=False,
+                shuffle=False,
+            )
+        else:
+            loader_test = DataLoader(
+                data_set=DictDataSet(
+                    ModelInputDict(
+                        x=torch.empty(0, 0, 0),
+                        cond=torch.empty(0, 0),
+                        num_points=torch.empty(0, 0, dtype=torch.int64),
+                        layer=torch.empty(0, 0, dtype=torch.int64),
+                        mask=torch.empty(0, 0, dtype=torch.bool),
+                        label=torch.empty(0, 0, dtype=torch.int64),
+                        noise=None,
+                    )
+                ),
+                batch_size=batch_size,
+                drop_last=False,
+                shuffle=False,
+            )
+
+        trafos = {
+            "samples_energy_trafo": se_trafo,
+            "samples_coordinate_trafo": sc_trafo,
+            "cond_trafo": c_trafo,
+            **({
+                "samples_time_trafo": st_trafo
+            } if st_trafo is not None else {}),
+        }
+        return loader_train, loader_test, trafos
+
+    # --- Original in-memory path (unchanged) ---
     start = rank * (split // world_size)
     stop = (rank + 1) * (split // world_size)
     data_train = DictDataSet(
