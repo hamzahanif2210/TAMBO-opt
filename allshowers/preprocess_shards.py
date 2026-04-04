@@ -8,6 +8,12 @@ Usage
         --val-events 30000 \\
         --shard-size 70000
 
+python /n/home04/hhanif/AllShowers/allshowers/preprocess_shards.py /n/home04/hhanif/AllShowers/conf/AllShowers_transformation/allshowers_electrons.yaml \
+   --output-dir  /n/holylfs05/LABS/arguelles_delgado_lab/Everyone/hhanif/tambo_simulations_for_training/preprocessed_electrons \
+        --train-events 700000 \
+        --val-events 30000 \
+        --shard-size 30000
+
 This reads the H5 file, lets you specify exactly how many events to use
 for training and validation, transforms them, and writes .pt shards:
 
