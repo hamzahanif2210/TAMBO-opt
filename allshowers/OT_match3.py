@@ -84,10 +84,13 @@ def parse_args() -> argparse.Namespace:
 def list_shards(preprocessed_dir: str) -> list[str]:
     shard_files = sorted(
         f for f in os.listdir(preprocessed_dir)
-        if f.endswith(".pt")
+        if f.endswith(".pt") and (f.startswith("train_") or f.startswith("val_"))
     )
     if not shard_files:
-        raise FileNotFoundError(f"No .pt shard files found in {preprocessed_dir}")
+        raise FileNotFoundError(
+            "No train_/val_ .pt shard files found in "
+            f"{preprocessed_dir}"
+        )
     return shard_files
 
 
