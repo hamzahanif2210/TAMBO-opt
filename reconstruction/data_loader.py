@@ -86,8 +86,12 @@ def load_data_file(
             cond_parts.append(load_dataset(file, feat, start, end))
 
     # Target: directions + label + energy (all as float for flow matching)
-    labels_float = labels.to(torch.get_default_dtype()).unsqueeze(-1)
-    energies_float = energies.to(torch.get_default_dtype()).unsqueeze(-1)
+    labels_float = labels.to(torch.get_default_dtype())
+    if labels_float.dim() == 1:
+        labels_float = labels_float.unsqueeze(-1)
+    energies_float = energies.to(torch.get_default_dtype())
+    if energies_float.dim() == 1:
+        energies_float = energies_float.unsqueeze(-1)
     target = torch.cat([directions, labels_float, energies_float], dim=-1)  # (N, 5)
 
     condition = torch.cat(cond_parts, dim=-1)  # (N, D_cond)
