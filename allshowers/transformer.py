@@ -22,7 +22,9 @@ def compute_mask(
     if num_layer_cond < 0:
 
         def mask_fn(b, h, q_idx, kv_idx):
-            return padding_mask[b, q_idx] & padding_mask[b, kv_idx]
+            valid = padding_mask[b, q_idx] & padding_mask[b, kv_idx]
+            self_loop = (q_idx == kv_idx) & ~padding_mask[b, q_idx]
+            return valid | self_loop
     else:
 
         def mask_fn(b, h, q_idx, kv_idx):
@@ -31,7 +33,8 @@ def compute_mask(
             )
             upper_bound = layer[b, q_idx] - layer[b, kv_idx] <= num_layer_cond // 2
             not_padding = padding_mask[b, q_idx] & padding_mask[b, kv_idx]
-            return lower_bound & upper_bound & not_padding
+            self_loop = (q_idx == kv_idx) & ~padding_mask[b, q_idx]
+            return (lower_bound & upper_bound & not_padding) | self_loop
 
     sequence_length = padding_mask.shape[1]
     batch_size = padding_mask.shape[0]

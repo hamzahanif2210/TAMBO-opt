@@ -360,7 +360,8 @@ class Trainer:
             if isinstance(batch[key], torch.Tensor):
                 batch[key] = batch[key].to(self.device)
         losses = self.flow.loss(**batch)
-        losses = losses * batch["mask"].to(losses.dtype)
+        mask = batch["mask"].expand_as(losses)
+        losses = torch.where(mask, losses, torch.zeros_like(losses))
         losses = torch.mean(losses, dim=(1, 2))
         return losses
 
@@ -379,6 +380,9 @@ class Trainer:
                 losses = self.get_loss(batch)
                 loss = torch.mean(losses)
                 loss.backward()
+                for p in self.flow.parameters():
+                    if p.grad is not None:
+                        torch.nan_to_num(p.grad, nan=0.0, posinf=1e4, neginf=-1e4, out=p.grad)
                 self.grad_norms.append(
                     get_total_norm(
                         p.grad for p in self.flow.parameters() if p.grad is not None
