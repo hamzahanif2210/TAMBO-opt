@@ -1,3 +1,4 @@
+import copy
 import os
 import time
 import warnings
@@ -366,7 +367,11 @@ def get_data_loaders(
             local_rank=local_rank,
         )
 
-        # 2) Build a load function that loads & transforms a [start, stop) slice
+        # 2) Build a load function that loads & transforms a [start, stop) slice.
+        #    Deep-copy config so trafo objects stay on CPU even after train.py
+        #    moves the returned trafos dict to CUDA.
+        chunk_cfg = copy.deepcopy(config_dataset)
+
         def _make_load_fn(
             cfg: dict, offset: int, tf: str
         ) -> Callable[[int, int], ModelInputDict]:
@@ -382,7 +387,7 @@ def get_data_loaders(
 
         total_train = stop - start
         loader_train = ChunkedDataLoader(
-            load_fn=_make_load_fn(config_dataset, start, trafos_file),
+            load_fn=_make_load_fn(chunk_cfg, start, trafos_file),
             total_samples=total_train,
             chunk_size=chunk_size,
             batch_size=batch_size,
@@ -392,7 +397,7 @@ def get_data_loaders(
 
         if rank == 0:
             loader_test = ChunkedDataLoader(
-                load_fn=_make_load_fn(config_dataset, split, trafos_file),
+                load_fn=_make_load_fn(chunk_cfg, split, trafos_file),
                 total_samples=val_len,
                 chunk_size=chunk_size,
                 batch_size=batch_size,
