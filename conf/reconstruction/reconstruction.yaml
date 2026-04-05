@@ -43,19 +43,46 @@ model:
   name: FullyConnected
   dim_input: 5             # directions (3) + pdg (1) + energy (1)
   dim_condition: 72        # 3 observables x 1 particle type x 24 layers
-  dim_time: 6
+  dim_time: 6              # 2 * frequencies (default frequencies=3)
   hidden_dims:
     - 256
     - 512
     - 1024
     - 512
     - 256
+  # flow:                  # uncomment to override CNF defaults
+  #   frequencies: 3       # produces dim_time = 2 * frequencies
 
 training:
   epochs: 500
   steps: 100
+  weight_decay: 1.e-2
+  grad_clip: 0.2
   optimizer:
-    name: Adam
+    name: Ranger
     lr: 0.001
-  scheduler:
-    name: OneCycleLR
+  scheduler: Cosine
+
+# ─── Alternative model configs (uncomment to switch) ────────────────────────
+#
+# # ConcatSquash: condition embedding added before each layer
+# model:
+#   name: ConcatSquash
+#   dim_input: 5
+#   dim_condition: 72
+#   dim_time: 6
+#   hidden_dims: [256, 512, 1024, 512, 256]
+#
+# # Transformer: self-attention on condition tokens + query token
+# model:
+#   name: Transformer
+#   dim_input: 5
+#   dim_condition: 72
+#   dim_time: 6
+#   d_model: 128
+#   nhead: 4
+#   num_layers: 4
+#   dim_feedforward: 512
+#   dropout: 0.0
+#   num_tokens: 8          # condition is split into 8 tokens
+#   activation: gelu

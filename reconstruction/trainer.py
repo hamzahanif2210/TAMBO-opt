@@ -24,6 +24,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import yaml
+from torch.nn.utils import clip_grad_norm_
 
 from reconstruction import flow_matching, models
 from reconstruction.data_loader import DataLoader, get_loaders
@@ -49,10 +50,14 @@ class Trainer:
         self.dim_data = self.train_loader.data.shape[1]    # 5: directions(3) + pdg(1) + energy(1)
         self.dim_condition = self.train_loader.condition.shape[1]
         self.steps = training_config.get("steps", 50)
+        self.weight_decay = training_config.get("weight_decay", 0)
+        self.grad_clip = training_config.get("grad_clip", None)
+
+        self.scheduler_interval = "never"  # updated by __init_scheduler
 
         self.model = self.__init_model(model_config)
         self.optimizer = self.__init_optimizer(training_config["optimizer"])
-        self.scheduler = self.__init_scheduler(training_config.get("scheduler", {}))
+        self.scheduler = self.__init_scheduler(training_config.get("scheduler", None))
 
         self.train_losses: list[float] = []
         self.val_losses: list[float] = []
@@ -103,6 +108,10 @@ class Trainer:
         print(
             f"Number of parameters: {sum(p.numel() for p in self.model.parameters())}"
         )
+        print(f"Optimizer: {type(self.optimizer).__name__}")
+        print(f"Scheduler: {type(self.scheduler).__name__ if self.scheduler else 'None'} ({self.scheduler_interval})")
+        print(f"Weight decay: {self.weight_decay}")
+        print(f"Grad clip: {self.grad_clip}")
         print()
         sys.stdout.flush()
 
@@ -117,34 +126,84 @@ class Trainer:
         flow = flow_matching.CNF(model_object, **flow_config)
         return flow.to(self.device)
 
-    def __init_optimizer(self, config: dict) -> optim.Optimizer:
-        config = config.copy()
+    def __init_optimizer(self, config: dict | str) -> optim.Optimizer:
+        if isinstance(config, str):
+            config = {"name": config}
+        else:
+            config = config.copy()
         optimizer_name = config.pop("name")
-        optimizer_class = getattr(optim, optimizer_name)
         if "lr" in config:
             self.lr = config["lr"]
         else:
             raise ValueError("Learning rate missing.")
-        return optimizer_class(self.model.parameters(), **config)
 
-    def __init_scheduler(self, config: dict) -> optim.lr_scheduler._LRScheduler | None:
-        config = config.copy()
+        name_lower = optimizer_name.lower().strip()
+        if name_lower == "ranger":
+            try:
+                from rangerlite import RangerLite
+            except ImportError as e:
+                raise ImportError(
+                    "Ranger optimizer requires 'rangerlite'. "
+                    "Install with: pip install rangerlite"
+                ) from e
+            return RangerLite(
+                params=self.model.parameters(),
+                lr=self.lr,
+                betas=config.get("betas", (0.95, 0.999)),
+                eps=config.get("eps", 1e-5),
+                weight_decay=self.weight_decay,
+                lookahead_steps=config.get("lookahead_steps", 6),
+                lookahead_alpha=config.get("lookahead_alpha", 0.5),
+            )
+        elif name_lower in ("adamw", "adam", "sgd"):
+            optimizer_class = getattr(optim, optimizer_name)
+            config["weight_decay"] = self.weight_decay
+            return optimizer_class(self.model.parameters(), **config)
+        else:
+            optimizer_class = getattr(optim, optimizer_name)
+            return optimizer_class(self.model.parameters(), **config)
+
+    def __init_scheduler(self, config: dict | str | None) -> optim.lr_scheduler._LRScheduler | None:
+        if config is None or config == {}:
+            return None
+        if isinstance(config, str):
+            config = {"name": config}
+        else:
+            config = config.copy()
         if "name" not in config:
             return None
         scheduler_name = config.pop("name")
-        if scheduler_name not in optim.lr_scheduler.__all__:
-            raise ValueError(
-                f"Scheduler {scheduler_name} not found in torch.optim.lr_scheduler."
+        name_lower = scheduler_name.lower().strip()
+
+        total_steps = len(self.train_loader) * self.epochs
+
+        if name_lower == "cosine":
+            self.scheduler_interval = "epoch"
+            return optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=self.epochs, **config
             )
-        scheduler_class: type[optim.lr_scheduler._LRScheduler] = getattr(
-            optim.lr_scheduler, scheduler_name
-        )
-        if scheduler_class is optim.lr_scheduler.OneCycleLR:
+        elif name_lower == "onecycle":
+            self.scheduler_interval = "step"
             config["max_lr"] = self.lr
-            config["total_steps"] = len(self.train_loader) * self.epochs
-        elif scheduler_class is optim.lr_scheduler.CosineAnnealingLR:
-            config["T_max"] = len(self.train_loader) * self.epochs
-        return scheduler_class(self.optimizer, **config)
+            config["total_steps"] = total_steps
+            return optim.lr_scheduler.OneCycleLR(self.optimizer, **config)
+        elif name_lower == "cosineannealing" or name_lower == "cosineannealinglr":
+            self.scheduler_interval = "epoch"
+            config.setdefault("T_max", self.epochs)
+            return optim.lr_scheduler.CosineAnnealingLR(self.optimizer, **config)
+        else:
+            if scheduler_name not in optim.lr_scheduler.__all__:
+                raise ValueError(
+                    f"Scheduler '{scheduler_name}' not found in torch.optim.lr_scheduler."
+                )
+            scheduler_class = getattr(optim.lr_scheduler, scheduler_name)
+            if scheduler_class is optim.lr_scheduler.OneCycleLR:
+                self.scheduler_interval = "step"
+                config["max_lr"] = self.lr
+                config["total_steps"] = total_steps
+            else:
+                self.scheduler_interval = "epoch"
+            return scheduler_class(self.optimizer, **config)
 
     def __get_file_path(self, filename: str) -> str:
         full_path = os.path.join(self.result_dir, filename)
@@ -243,10 +302,14 @@ class Trainer:
                 losses = self.model.loss(x, condition, noise)
                 loss = torch.mean(losses)
                 loss.backward()
+                if self.grad_clip:
+                    clip_grad_norm_(self.model.parameters(), self.grad_clip)
                 self.optimizer.step()
                 train_loss += loss.item()
-                if self.scheduler is not None:
+                if self.scheduler is not None and self.scheduler_interval == "step":
                     self.scheduler.step()
+            if self.scheduler is not None and self.scheduler_interval == "epoch":
+                self.scheduler.step()
             train_loss /= len(self.train_loader)
             self.train_losses.append(train_loss)
 
