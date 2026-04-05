@@ -40,7 +40,7 @@ data:
   num_val: 30000
 
 model:
-  name: ConcatSquash
+  name: FullyConnected
   dim_input: 5             # directions (3) + pdg (1) + energy (1)
   dim_condition: 72        # 3 observables x 1 particle type x 24 layers
   dim_time: 6
