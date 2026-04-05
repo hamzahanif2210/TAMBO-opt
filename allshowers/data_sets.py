@@ -295,17 +295,50 @@ def _init_trafos_from_sample(
     """Fit transformations on a small sample without loading the full dataset.
 
     Only used in chunked mode to initialise trafos before streaming begins.
-    Loads at most ``sample_size`` samples from the beginning of the file.
+
+    * rank 0: loads ``sample_size`` samples, fits trafos, saves to ``trafos_file``
+    * rank != 0: waits for rank 0, then loads the fitted trafos from file
+      (no data is loaded from the HDF5 file on non-zero ranks)
+
+    Synchronisation is handled here with a single explicit barrier, so
+    ``initialise_trafos`` is called with ``world_size=1`` to avoid its
+    internal barrier logic (which would deadlock since only rank 0 enters it).
     """
-    load_and_prepare(
-        **config_dataset,
-        start=0,
-        stop=sample_size,
-        trafos_file=trafos_file,
-        world_size=world_size,
-        rank=rank,
-        local_rank=local_rank,
-    )
+    if rank == 0:
+        # Rank 0 loads a small sample, fits trafos, and saves them to disk.
+        # Pass world_size=1 so initialise_trafos skips its internal barriers;
+        # we synchronise with other ranks ourselves via the barrier below.
+        load_and_prepare(
+            **config_dataset,
+            start=0,
+            stop=sample_size,
+            trafos_file=trafos_file,
+            world_size=1,
+            rank=0,
+            local_rank=local_rank,
+        )
+
+    # Single barrier: rank 0 has saved trafos_file; other ranks can now load it
+    if world_size > 1:
+        time.sleep(5)  # NFS propagation grace period (rank 0 just wrote the file)
+        torch.distributed.barrier(device_ids=[local_rank])
+
+    if rank != 0:
+        if not os.path.isfile(trafos_file):
+            raise FileNotFoundError(
+                f"[rank {rank}] trafos_file {trafos_file} not found after "
+                "waiting for rank 0."
+            )
+        parameters = torch.load(trafos_file, weights_only=True)
+        for key in (
+            "samples_energy_trafo",
+            "samples_coordinate_trafo",
+            "cond_trafo",
+            "samples_time_trafo",
+        ):
+            if key in config_dataset and key in parameters:
+                config_dataset[key].load_state_dict(parameters[key])
+        print(f"[rank {rank}] Loaded transformations from {trafos_file}")
 
 
 def get_data_loaders(
