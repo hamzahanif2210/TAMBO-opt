@@ -43,7 +43,7 @@ model:
   name: ConcatSquash
   dim_input: 5             # directions (3) + pdg (1) + energy (1)
   dim_condition: 72        # 3 observables x 1 particle type x 24 layers
-  dim_time: 12
+  dim_time: 6
   hidden_dims:
     - 256
     - 512
