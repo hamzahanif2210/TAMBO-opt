@@ -380,9 +380,23 @@ class Trainer:
                 losses = self.get_loss(batch)
                 loss = torch.mean(losses)
                 loss.backward()
+                # Diagnose and fix inf/nan gradients
+                if step == 0 and epoch <= 2 and self.rank == 0:
+                    for name, p in self.flow.named_parameters():
+                        if p.grad is not None:
+                            has_inf = torch.isinf(p.grad).any().item()
+                            has_nan = torch.isnan(p.grad).any().item()
+                            if has_inf or has_nan:
+                                print(
+                                    f"  BAD GRAD: {name} shape={tuple(p.grad.shape)} "
+                                    f"inf={has_inf} nan={has_nan} "
+                                    f"max={p.grad.abs().max().item():.4g}",
+                                    flush=True,
+                                )
                 for p in self.flow.parameters():
                     if p.grad is not None:
-                        torch.nan_to_num(p.grad, nan=0.0, posinf=1e4, neginf=-1e4, out=p.grad)
+                        p.grad.clamp_(-1e4, 1e4)
+                        p.grad.nan_to_num_(0.0)
                 self.grad_norms.append(
                     get_total_norm(
                         p.grad for p in self.flow.parameters() if p.grad is not None
