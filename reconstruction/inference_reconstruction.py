@@ -724,22 +724,22 @@ def main():
     outdir.mkdir(parents=True, exist_ok=True)
     print(f"\nOutput directory: {outdir}")
 
-    # print("\nGenerating aggregate plots ...")
+    print("\nGenerating aggregate plots ...")
 
-    # plot_direction_components(gt_dirs, pred_dirs_list, all_labels, outdir)
-    # print("  Saved: directions.png")
+    plot_direction_components(gt_dirs, pred_dirs_list, all_labels, outdir)
+    print("  Saved: directions.png")
 
-    # plot_pdg_classification(gt_labels_arr, pred_pdg_list, all_labels, pdg_names, outdir)
-    # print("  Saved: pdg_accuracy.png")
+    plot_pdg_classification(gt_labels_arr, pred_pdg_list, all_labels, pdg_names, outdir)
+    print("  Saved: pdg_accuracy.png")
 
-    # plot_pdg_distribution(gt_labels_arr, pred_pdg_list, all_labels, pdg_names, outdir)
-    # print("  Saved: pdg_distribution.png")
+    plot_pdg_distribution(gt_labels_arr, pred_pdg_list, all_labels, pdg_names, outdir)
+    print("  Saved: pdg_distribution.png")
 
-    # plot_energy(gt_energy, pred_energy_list, all_labels, outdir)
-    # print("  Saved: energy.png")
+    plot_energy(gt_energy, pred_energy_list, all_labels, outdir)
+    print("  Saved: energy.png")
 
-    # plot_energy_per_class(gt_energy, gt_labels_arr, pred_energy_list, all_labels, pdg_names, outdir)
-    # print("  Saved: energy_per_class.png")
+    plot_energy_per_class(gt_energy, gt_labels_arr, pred_energy_list, all_labels, pdg_names, outdir)
+    print("  Saved: energy_per_class.png")
 
     print(f"\nGenerating per-sample plots (num_per_sample_plots={num_per_sample}) ...")
     plot_per_sample(

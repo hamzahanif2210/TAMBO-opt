@@ -20,47 +20,6 @@ from torch.nn.utils import clip_grad_norm_, get_total_norm
 from allshowers import data_loader, data_sets, flow_matching, transformer, util
 
 
-class CombinedOptimizer:
-    """Wraps multiple optimizers so they behave like a single one.
-
-    Used for Muon, which splits parameters into 2D (Muon) and non-2D (AdamW)
-    groups. All public methods mirror the torch.optim.Optimizer interface so
-    the rest of the Trainer code needs no special-casing.
-    """
-
-    def __init__(self, optimizers: list[torch.optim.Optimizer]) -> None:
-        self.optimizers = optimizers
-
-    @property
-    def param_groups(self) -> list:
-        """Flatten param_groups from all sub-optimizers.
-        param_groups[0] is always Muon's group — used for lr logging."""
-        groups = []
-        for opt in self.optimizers:
-            groups.extend(opt.param_groups)
-        return groups
-
-    def zero_grad(self, set_to_none: bool = True) -> None:
-        for opt in self.optimizers:
-            opt.zero_grad(set_to_none=set_to_none)
-
-    def step(self) -> None:
-        for opt in self.optimizers:
-            opt.step()
-
-    def state_dict(self) -> dict:
-        return {
-            f"optimizer_{i}": opt.state_dict()
-            for i, opt in enumerate(self.optimizers)
-        }
-
-    def load_state_dict(self, state_dict: dict) -> None:
-        for i, opt in enumerate(self.optimizers):
-            key = f"optimizer_{i}"
-            if key in state_dict:
-                opt.load_state_dict(state_dict[key])
-
-
 class Trainer:
     def __init__(
         self,
@@ -118,18 +77,8 @@ class Trainer:
                 p.numel() for p in self.flow.parameters() if p.requires_grad
             )
             print(f"number of parameters: {number_of_parameters}")
-            n_train = (
-                self.train_loader.total_samples
-                if hasattr(self.train_loader, "total_samples")
-                else len(self.train_loader.data_set)
-            )
-            n_val = (
-                self.val_loader.total_samples
-                if hasattr(self.val_loader, "total_samples")
-                else len(self.val_loader.data_set)
-            )
-            print("train samples:", n_train)
-            print("val samples:", n_val)
+            print("train samples:", len(self.train_loader.data_set))
+            print("val samples:", len(self.val_loader.data_set))
             print("batch size:", self.batch_size)
             print("gradient accumulation:", self.grad_accum)
             print("num epochs:", self.num_epochs)
@@ -166,19 +115,8 @@ class Trainer:
             flow.network = DDP(flow.network, device_ids=[self.device.index])  # type: ignore
         self.flow = flow
 
-    def _scheduler_step(self, interval: str) -> None:
-        """Step scheduler(s) — handles both single and list (Muon) schedulers."""
-        if self.scheduler is None or self.scheduler_interval != interval:
-            return
-        if isinstance(self.scheduler, list):
-            for s in self.scheduler:
-                s.step()
-        else:
-            self.scheduler.step()
-
     def configure_optimizer(self) -> None:
         optimizer_name = self.optimizer_name.lower().strip()
-
         if optimizer_name == "adamw":
             self.optimizer = optim.AdamW(
                 params=self.flow.network.parameters(),
@@ -210,100 +148,25 @@ class Trainer:
                 lookahead_steps=6,
                 lookahead_alpha=0.5,
             )
-        elif optimizer_name == "muon":
-            if not hasattr(optim, "Muon"):
-                raise ImportError(
-                    "Muon optimizer requires PyTorch >= 2.9. "
-                    "Use optimizer: Ranger or optimizer: AdamW instead."
-                )
-            # Unwrap DDP to access bare parameters
-            base_network = (
-                self.flow.network.module
-                if hasattr(self.flow.network, "module")
-                else self.flow.network
-            )
-            muon_params = [p for p in base_network.parameters() if p.ndim == 2]
-            other_params = [p for p in base_network.parameters() if p.ndim != 2]
-            if muon_params and other_params:
-                self.optimizer = CombinedOptimizer([
-                    optim.Muon(
-                        muon_params,
-                        lr=self.learning_rate,
-                        weight_decay=self.weight_decay,
-                        adjust_lr_fn="match_rms_adamw",
-                    ),
-                    optim.AdamW(
-                        other_params,
-                        lr=self.learning_rate,
-                        weight_decay=self.weight_decay,
-                        betas=(0.9, 0.999),
-                        eps=1e-8,
-                    ),
-                ])
-            elif muon_params:
-                self.optimizer = optim.Muon(
-                    muon_params,
-                    lr=self.learning_rate,
-                    weight_decay=self.weight_decay,
-                    adjust_lr_fn="match_rms_adamw",
-                )
-            else:
-                self.optimizer = optim.AdamW(
-                    other_params,
-                    lr=self.learning_rate,
-                    weight_decay=self.weight_decay,
-                )
         else:
             raise NotImplementedError(
                 f"Optimizer {self.optimizer_name} not implemented."
             )
 
-        # ---- scheduler setup ----
-        # For Muon (CombinedOptimizer) only Cosine is supported.
-        # Each sub-optimizer gets its own scheduler instance.
-        if optimizer_name == "muon":
-            if self.scheduler_name is None:
-                self.scheduler = None
-                self.scheduler_interval = "never"
-            elif self.scheduler_name.lower() == "cosine":
-                if isinstance(self.optimizer, CombinedOptimizer):
-                    self.scheduler = [
-                        optim.lr_scheduler.CosineAnnealingLR(
-                            opt, T_max=self.num_epochs
-                        )
-                        for opt in self.optimizer.optimizers
-                    ]
-                else:
-                    # Muon-only path (no AdamW fallback needed)
-                    self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                        self.optimizer, T_max=self.num_epochs
-                    )
-                self.scheduler_interval = "epoch"
-            else:
-                warnings.warn(
-                    f"Scheduler '{self.scheduler_name}' is not supported with Muon. "
-                    "Only Cosine is supported. Disabling scheduler.",
-                    UserWarning,
-                )
-                self.scheduler = None
-                self.scheduler_interval = "never"
-            return  # skip the standard scheduler block below
-
-        # Standard scheduler block for all other optimizers
         if self.scheduler_name is None:
             self.scheduler = None
             self.scheduler_interval = "never"
-        elif self.scheduler_name.lower() == "step":
+        elif self.scheduler_name.lower() == "Step".lower():
             self.scheduler = optim.lr_scheduler.StepLR(
                 optimizer=self.optimizer, step_size=self.num_epochs // 3, gamma=0.1
             )
             self.scheduler_interval = "epoch"
-        elif self.scheduler_name.lower() == "exponential":
+        elif self.scheduler_name.lower() == "Exponential".lower():
             self.scheduler = optim.lr_scheduler.ExponentialLR(
                 optimizer=self.optimizer, gamma=3e-3 ** (1.0 / self.num_epochs)
             )
             self.scheduler_interval = "epoch"
-        elif self.scheduler_name.lower() == "onecycle":
+        elif self.scheduler_name.lower() == "OneCycle".lower():
             self.scheduler = optim.lr_scheduler.OneCycleLR(
                 optimizer=self.optimizer,
                 max_lr=self.learning_rate,
@@ -311,12 +174,12 @@ class Trainer:
                 * (len(self.train_loader) // self.grad_accum),
             )
             self.scheduler_interval = "step"
-        elif self.scheduler_name.lower() == "cosine":
+        elif self.scheduler_name.lower() == "Cosine".lower():
             self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
                 optimizer=self.optimizer, T_max=self.num_epochs
             )
             self.scheduler_interval = "epoch"
-        elif self.scheduler_name.lower() == "cosinewarmup":
+        elif self.scheduler_name.lower() == "CosineWarmup".lower():
             warmup_epochs = 1
             self.scheduler = optim.lr_scheduler.SequentialLR(
                 optimizer=self.optimizer,
@@ -360,8 +223,7 @@ class Trainer:
             if isinstance(batch[key], torch.Tensor):
                 batch[key] = batch[key].to(self.device)
         losses = self.flow.loss(**batch)
-        mask = batch["mask"].expand_as(losses)
-        losses = torch.where(mask, losses, torch.zeros_like(losses))
+        losses = losses * batch["mask"].to(losses.dtype)
         losses = torch.mean(losses, dim=(1, 2))
         return losses
 
@@ -380,23 +242,6 @@ class Trainer:
                 losses = self.get_loss(batch)
                 loss = torch.mean(losses)
                 loss.backward()
-                # Diagnose and fix inf/nan gradients
-                if step == 0 and epoch <= 2 and self.rank == 0:
-                    for name, p in self.flow.named_parameters():
-                        if p.grad is not None:
-                            has_inf = torch.isinf(p.grad).any().item()
-                            has_nan = torch.isnan(p.grad).any().item()
-                            if has_inf or has_nan:
-                                print(
-                                    f"  BAD GRAD: {name} shape={tuple(p.grad.shape)} "
-                                    f"inf={has_inf} nan={has_nan} "
-                                    f"max={p.grad.abs().max().item():.4g}",
-                                    flush=True,
-                                )
-                for p in self.flow.parameters():
-                    if p.grad is not None:
-                        p.grad.clamp_(-1e4, 1e4)
-                        p.grad.nan_to_num_(0.0)
                 self.grad_norms.append(
                     get_total_norm(
                         p.grad for p in self.flow.parameters() if p.grad is not None
@@ -406,13 +251,15 @@ class Trainer:
                     if self.grad_clip:
                         clip_grad_norm_(self.flow.parameters(), self.grad_clip)
                     self.optimizer.step()
-                    self._scheduler_step("step")
+                    if self.scheduler_interval == "step" and self.scheduler is not None:
+                        self.scheduler.step()
                     self.optimizer.zero_grad()
                 train_loss_sum += loss.item() * len(losses)
                 train_loss_count += len(losses)
                 self.train_losses_batch.append(loss.item())
                 self.learning_rates.append(self.optimizer.param_groups[0]["lr"])
-            self._scheduler_step("epoch")
+            if self.scheduler_interval == "epoch" and self.scheduler is not None:
+                self.scheduler.step()
             if self.rank == 0:
                 self.train_losses.append(train_loss_sum / train_loss_count)
                 self.evaluate_and_save()
@@ -470,29 +317,6 @@ class Trainer:
     def __signal_handler(self, sig, frame):
         self.killed = True
 
-    def _get_scheduler_state_dict(self) -> dict:
-        """Serialize scheduler state — handles single scheduler and list (Muon)."""
-        if self.scheduler is None:
-            return {}
-        if isinstance(self.scheduler, list):
-            return {
-                f"scheduler_{i}": s.state_dict()
-                for i, s in enumerate(self.scheduler)
-            }
-        return self.scheduler.state_dict()
-
-    def _load_scheduler_state_dict(self, state_dict: dict) -> None:
-        """Restore scheduler state — handles single scheduler and list (Muon)."""
-        if self.scheduler is None or not state_dict:
-            return
-        if isinstance(self.scheduler, list):
-            for i, s in enumerate(self.scheduler):
-                key = f"scheduler_{i}"
-                if key in state_dict:
-                    s.load_state_dict(state_dict[key])
-        else:
-            self.scheduler.load_state_dict(state_dict)
-
     def save(self) -> None:
         # ignore interruptions while writing checkpoints
         original_sigint_handler = signal.getsignal(signal.SIGINT)
@@ -519,6 +343,10 @@ class Trainer:
                 f.write(f"{loss} {grad_norm} {lr}\n")
 
         # save checkpoint
+        if self.scheduler is None:
+            scheduler_state_dict = {}
+        else:
+            scheduler_state_dict = self.scheduler.state_dict()
         flow_state_dict = self.flow.state_dict()
         for key in list(flow_state_dict.keys()):
             if "module." in key:
@@ -535,7 +363,7 @@ class Trainer:
             "min_val_loss": self.min_val_loss,
             "min_score": self.min_score,
             "optimizer": self.optimizer.state_dict(),
-            "scheduler": self._get_scheduler_state_dict(),
+            "scheduler": scheduler_state_dict,
         }
         if os.path.exists(self.checkpoint_file):
             os.remove(self.checkpoint_file)
@@ -593,7 +421,8 @@ class Trainer:
         self.min_val_loss = checkpoint["min_val_loss"]
         self.min_score = checkpoint["min_score"]
         self.optimizer.load_state_dict(checkpoint["optimizer"])
-        self._load_scheduler_state_dict(checkpoint["scheduler"])
+        if self.scheduler is not None:
+            self.scheduler.load_state_dict(checkpoint["scheduler"])
 
         print(
             f"[rank={self.rank}]: Loaded {self.checkpoint_file} at epoch {self.epoch}."

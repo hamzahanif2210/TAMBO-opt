@@ -23,6 +23,7 @@ data:
   # PDG label (integer 0/1): dequantize to make continuous, then standardize.
   # Dequantize adds U(0,1) noise: 0->[0,1), 1->[1,2). Inverse uses floor().
   transform_pdg:
+    - [Dequantize]                    # smooths integers → floats
     - [StandardScaler, {shape: [1, 1]}]
 
   # Energy: log-transform then standardize (same as allshowers energy trafo)
@@ -42,7 +43,7 @@ model:
   name: FullyConnected
   dim_input: 5             # directions (3) + pdg (1) + energy (1)
   dim_condition: 72        # 3 observables x 1 particle type x 24 layers
-  dim_time: 18
+  dim_time: 6
   # hidden_dims:
   #   - 256
   #   - 512
@@ -56,9 +57,9 @@ model:
     - 256
     - 128
   flow:
-    frequencies: 9
+    frequencies: 3
 training:
-  epochs: 1000
+  epochs: 2000
   steps: 100
   optimizer:
     name: Adam

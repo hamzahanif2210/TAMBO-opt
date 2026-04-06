@@ -172,3 +172,4 @@ plots
 uv.lock
 cpp
 logs
+*.png

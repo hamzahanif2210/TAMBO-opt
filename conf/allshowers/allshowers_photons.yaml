@@ -18,7 +18,8 @@ data:
   return_noise: True
   return_direction: True
   val_len: 30000
-  max_num_points: 6016
+  # max_num_points: 6016
+  max_num_points: 2048
 
 
 model:

@@ -16,28 +16,28 @@ CONFIG = {
                 "/n/home04/hhanif/AllShowers/results"
                 "/20260402_235544_Electron-PointCountFM/compiled.pt"
             ),
-            "label": "concquat squash",
+            "label": "ML - Concquat Squash",
         },
         {
             "path": (
                 "/n/home04/hhanif/AllShowers/results"
                 "/20260402_234941_Electron-PointCountFM/compiled.pt"
             ),
-            "label": "fully connected",
+            "label": "ML - Fully Connected",
         },
         {
             "path": "/n/home04/hhanif/AllShowers/results/20260403_013247_Electron-PointCountFM/compiled.pt",
-            "label": "dequantized fully connected",
+            "label": "NL - Fully Connected with dequantized",
         },
     ],
 
     # How many showers to randomly sample PER PDG CLASS for per-shower plots.
     # Total plots = showers_per_class * len(pdg_codes)
-    "showers_per_class": 20,
+    "showers_per_class": 2000,
 
     # Pool to draw from: the script reads this many showers from the start of
     # the file to build the random sample.  Set to -1 to use the whole file.
-    "pool_stop": 500,
+    "pool_stop": 5000,
 
     # Detector geometry
     "num_layers": 24,
@@ -48,7 +48,7 @@ CONFIG = {
 
     # Human-readable names for each PDG class (same order as pdg_codes).
     "pdg_names": {
-        0: "e±/γ/π⁰",
+        0: "e±/π⁰",
         1: "π±",
     },
 

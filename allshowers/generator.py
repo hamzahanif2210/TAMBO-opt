@@ -11,8 +11,8 @@ python /n/home04/hhanif/AllShowers/allshowers/generator.py \
 
 # With time (model trained with samples_time_trafo in config):
 python /n/home04/hhanif/AllShowers/allshowers/generator.py \
-  --run-dir /n/home04/hhanif/AllShowers/results/20260402_150113_CNF-Transformer \
-  --num-samples 10000 \
+  --run-dir /n/home04/hhanif/AllShowers/results/20260404_205538_Electron-Allshower/ \
+  --num-samples 59774 \
   --num-timesteps 16 \
   --device cuda:0 \
   --solver midpoint \
@@ -77,7 +77,7 @@ class Generator(nn.Module):
         self.to(torch.get_default_dtype())
         self.feature_last = run_params["data"].get("feature_last", False)
         self.num_layers = run_params["model"].get("num_layers", None)
-        self.max_points = run_params["data"].get("max_num_points", 6016)
+        self.max_points = run_params["data"].get("max_num_points", 2000)
         self.expects_angles = run_params["model"]["dim_inputs"][-1] > 1
 
         # Auto-detect time mode from config — no CLI flag needed.
