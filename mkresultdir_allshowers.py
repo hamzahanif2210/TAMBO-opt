@@ -36,7 +36,7 @@ python /n/home04/hhanif/AllShowers/mkresultdir.py /n/home04/hhanif/AllShowers/co
 
 
 python /n/home04/hhanif/AllShowers/mkresultdir_allshowers.py /n/home04/hhanif/AllShowers/conf/allshowers/allshowers_photons.yaml\
-  -p gpu_requeue -g 1 -n 4 --mem 64G --cpus-per-task 1 --time 24:00:00 -r
+  -p gpu_requeue -g 1 -n 4 --mem 64G --cpus-per-task 1 --time 3:00:00 -r
 
 """
 

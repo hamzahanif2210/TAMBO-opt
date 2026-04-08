@@ -8,24 +8,26 @@ import argparse
 # Config
 # =============================================================================
 
-ml_file = "/n/home04/hhanif/AllShowers/results/20260404_205538_Electron-Allshower/samples01.h5"
+ml_file = "/n/home04/hhanif/AllShowers/results/20260404_205538_Electron-Allshower/samples02.h5"
 simulated_file = "/n/holylfs05/LABS/arguelles_delgado_lab/Everyone/hhanif/tambo_simulations_for_training/combined_electrons_balanced-test-file.h5"
 
 NUM_LAYERS = 24
 US = 1e6  # seconds -> microseconds
 
 CLASS_NAMES = {
-    0: r"$e^\pm/\gamma/\pi^0$",
+    0: r"$e^\pm/\pi^0$",
     1: r"$\pi^\pm$",
 }
-
-R_MIN = 0.0
-R_MAX = 200.0
-N_R_BINS = 60
 
 SIM_COLOR = "black"
 ML_COLOR = "blue"
 RATIO_COLOR = "blue"
+
+# Wider bins for cleaner radial profiles
+RADIAL_BINS = np.array(
+    [0, 5, 10, 15, 20, 30, 40, 50, 65, 80, 100, 125, 150, 175, 200],
+    dtype=float
+)
 
 
 # =============================================================================
@@ -119,11 +121,12 @@ def compute_avg_time_per_layer(pts, num_layers=NUM_LAYERS):
 
 def calc_energy_per_radial_bin_like_observables(pts, bin_edges):
     """
-    Match the logic of calc_energy_per_radial_bin(...) from observables.py:
-      - radial distance = sqrt(x^2 + y^2)
-      - bin assignment via np.digitize(...)-1
-      - energies thresholded with energy > 0
-      - overflow bins are zeroed
+    Same core logic as calc_energy_per_radial_bin:
+      - r = sqrt(x^2 + y^2)
+      - bin assignment with np.digitize(...)-1
+      - sum positive hit energies into radial bins
+    Returns:
+      energy_per_radial_bin: shape (n_showers, n_bins)
     """
     bin_edges = np.asarray(bin_edges, dtype=np.float32)
     n = pts.shape[0]
@@ -134,25 +137,19 @@ def calc_energy_per_radial_bin_like_observables(pts, bin_edges):
 
     energy_per_radial_bin = np.zeros((n, num_bins), dtype=np.float32)
 
-    shower_indices = (
-        np.arange(n).reshape(-1, 1).repeat(pts.shape[1], axis=1)
-    )
+    shower_indices = np.arange(n).reshape(-1, 1).repeat(pts.shape[1], axis=1)
 
-    energies = pts[..., 3].astype(np.float32) * (pts[..., 3] > 0).astype(np.float32)
+    energies = pts[..., 3].astype(np.float32)
+    valid_energy = energies > 0
+    energies = np.where(valid_energy, energies, 0.0)
 
-    overflow = (bin_indices == num_bins)
-    energies = energies.copy()
-    bin_indices = bin_indices.copy()
-    energies[overflow] = 0.0
-    bin_indices[overflow] = 0
+    valid_bins = (bin_indices >= 0) & (bin_indices < num_bins)
+    safe_bins = np.where(valid_bins, bin_indices, 0)
+    safe_energy = np.where(valid_bins, energies, 0.0)
 
-    # safety for underflow, though with non-negative radii it normally won't happen
-    underflow = bin_indices < 0
-    energies[underflow] = 0.0
-    bin_indices[underflow] = 0
-
-    np.add.at(energy_per_radial_bin, (shower_indices, bin_indices), energies)
+    np.add.at(energy_per_radial_bin, (shower_indices, safe_bins), safe_energy)
     return energy_per_radial_bin
+
 
 
 def compute_cell_energy_spectrum_with_errors(pts, bins):
@@ -240,7 +237,9 @@ def _step_fill(ax, edges, lower, upper, color, alpha=0.22, logx=False):
     else:
         x = 0.5 * (edges[:-1] + edges[1:])
     ax.fill_between(
-        x, lower, upper,
+        x,
+        lower,
+        upper,
         step="mid",
         color=color,
         alpha=alpha,
@@ -288,15 +287,35 @@ def style_ratio_axis(ax, xlabel, xlim=None, xticks=None, logx=False, ylim=(0.5, 
 # Plotting one panel pair
 # =============================================================================
 
-def plot_main_and_ratio(ax_main, ax_ratio, edges, sim_vals, sim_err, ml_vals, ml_err,
-                        sim_label, ml_label, ylabel, xlabel, title,
-                        sim_color=SIM_COLOR, ml_color=ML_COLOR,
-                        xlim=None, xticks=None, logx=False, logy=False,
-                        ratio_ylim=(0.5, 1.5)):
-    _stairs_with_band(ax_main, edges, sim_vals, sim_err, sim_label,
-                      color=sim_color, alpha_fill=0.20, logx=logx, logy=logy)
-    _stairs_with_band(ax_main, edges, ml_vals, ml_err, ml_label,
-                      color=ml_color, alpha_fill=0.20, logx=logx, logy=logy)
+def plot_main_and_ratio(
+    ax_main,
+    ax_ratio,
+    edges,
+    sim_vals,
+    sim_err,
+    ml_vals,
+    ml_err,
+    sim_label,
+    ml_label,
+    ylabel,
+    xlabel,
+    title,
+    sim_color=SIM_COLOR,
+    ml_color=ML_COLOR,
+    xlim=None,
+    xticks=None,
+    logx=False,
+    logy=False,
+    ratio_ylim=(0.5, 1.5),
+):
+    _stairs_with_band(
+        ax_main, edges, sim_vals, sim_err, sim_label,
+        color=sim_color, alpha_fill=0.20, logx=logx, logy=logy
+    )
+    _stairs_with_band(
+        ax_main, edges, ml_vals, ml_err, ml_label,
+        color=ml_color, alpha_fill=0.20, logx=logx, logy=logy
+    )
 
     if xlim is not None:
         ax_main.set_xlim(*xlim)
@@ -314,10 +333,18 @@ def plot_main_and_ratio(ax_main, ax_ratio, edges, sim_vals, sim_err, ml_vals, ml
     ax_main.tick_params(labelsize=7)
 
     ratio, ratio_err = ratio_and_error(ml_vals, ml_err, sim_vals, sim_err)
-    _stairs_ratio_with_band(ax_ratio, edges, ratio, ratio_err,
-                            color=RATIO_COLOR, alpha_fill=0.20, logx=logx)
-    style_ratio_axis(ax_ratio, xlabel=xlabel, xlim=xlim, xticks=xticks,
-                     logx=logx, ylim=ratio_ylim)
+    _stairs_ratio_with_band(
+        ax_ratio, edges, ratio, ratio_err,
+        color=RATIO_COLOR, alpha_fill=0.20, logx=logx
+    )
+    style_ratio_axis(
+        ax_ratio,
+        xlabel=xlabel,
+        xlim=xlim,
+        xticks=xticks,
+        logx=logx,
+        ylim=ratio_ylim,
+    )
 
 
 # =============================================================================
@@ -351,8 +378,8 @@ def plot_row(main_axes, ratio_axes, n, s_pts_sel, m_pts_sel, r_bins, num_layers=
             s_mean, s_sem, m_mean, m_sem,
             sim_label, ml_label,
             ylabel=r"Mean $t$ [$\mu$s]",
-            xlabel="Layer",
-            title="Avg Time per Layer",
+            xlabel="Plane",
+            title="Avg Time per Plane",
             xlim=layer_xlim,
             xticks=layer_xticks,
             logx=False,
@@ -381,8 +408,8 @@ def plot_row(main_axes, ratio_axes, n, s_pts_sel, m_pts_sel, r_bins, num_layers=
         axm, axr, layer_edges,
         s_mean, s_sem, m_mean, m_sem,
         sim_label, ml_label,
-        ylabel="Mean Energy",
-        xlabel="Layer",
+        ylabel="Mean Energy [GeV]",
+        xlabel="Plane",
         title="Longitudinal Energy Profile",
         xlim=layer_xlim,
         xticks=layer_xticks,
@@ -392,7 +419,8 @@ def plot_row(main_axes, ratio_axes, n, s_pts_sel, m_pts_sel, r_bins, num_layers=
     )
 
     # ------------------------------------------------------------------ #
-    # 2. Radial energy profile -> use calc_energy_per_radial_bin-style logic
+    # 2. Radial profile -> same observable style as energy_per_radial_bin
+    #    normalized per shower before taking the mean
     # ------------------------------------------------------------------ #
     axm = main_axes[2]
     axr = ratio_axes[2]
@@ -400,21 +428,48 @@ def plot_row(main_axes, ratio_axes, n, s_pts_sel, m_pts_sel, r_bins, num_layers=
     s_r_mat = calc_energy_per_radial_bin_like_observables(s_pts_sel, r_bins)
     m_r_mat = calc_energy_per_radial_bin_like_observables(m_pts_sel, r_bins)
 
+    s_r_sum = s_r_mat.sum(axis=1, keepdims=True)
+    m_r_sum = m_r_mat.sum(axis=1, keepdims=True)
+
+    s_r_mat = np.divide(s_r_mat, np.clip(s_r_sum, 1e-12, None))
+    m_r_mat = np.divide(m_r_mat, np.clip(m_r_sum, 1e-12, None))
+
     s_mean, s_sem = mean_and_sem(s_r_mat)
     m_mean, m_sem = mean_and_sem(m_r_mat)
 
-    plot_main_and_ratio(
-        axm, axr, r_bins,
-        s_mean, s_sem, m_mean, m_sem,
-        sim_label, ml_label,
-        ylabel="Mean energy / bin",
-        xlabel="Radius [m]",
-        title="Radial Energy Profile",
+    _stairs_with_band(
+        axm, r_bins, s_mean, s_sem, sim_label,
+        color=SIM_COLOR, alpha_fill=0.20, logx=False, logy=False
+    )
+    _stairs_with_band(
+        axm, r_bins, m_mean, m_sem, ml_label,
+        color=ML_COLOR, alpha_fill=0.20, logx=False, logy=False
+    )
+
+    axm.set_xlim(r_bins[0], r_bins[-1])
+    axm.grid(True, lw=0.4)
+    axm.legend(fontsize=7)
+    axm.set_title("Radial Profile (mean normalized)", fontsize=9)
+    axm.set_ylabel("Normalized Energy", fontsize=8)
+    axm.tick_params(labelsize=7)
+
+    ratio, ratio_err = ratio_and_error(m_mean, m_sem, s_mean, s_sem)
+
+    valid_ratio = np.isfinite(ratio) & np.isfinite(ratio_err) & (s_mean > 0)
+
+    ratio_plot = np.where(valid_ratio, ratio, np.nan)
+    ratio_err_plot = np.where(valid_ratio, ratio_err, np.nan)
+
+    _stairs_ratio_with_band(
+        axr, r_bins, ratio_plot, ratio_err_plot,
+        color=RATIO_COLOR, alpha_fill=0.20, logx=False
+    )
+    style_ratio_axis(
+        axr,
+        xlabel="Radial bin",
         xlim=(r_bins[0], r_bins[-1]),
-        xticks=None,
         logx=False,
-        logy=False,
-        ratio_ylim=(0.5, 1.5),
+        ylim=(0.8, 1.2),
     )
 
     # ------------------------------------------------------------------ #
@@ -437,14 +492,24 @@ def plot_row(main_axes, ratio_axes, n, s_pts_sel, m_pts_sel, r_bins, num_layers=
         m_counts, m_err = compute_cell_energy_spectrum_with_errors(m_pts_sel, bins_e)
 
         _stairs_values(axm, bins_e, s_counts, label=sim_label, color=SIM_COLOR, linewidth=1.8)
-        _step_fill(axm, bins_e, np.clip(s_counts - s_err, 1e-12, None), s_counts + s_err,
-                   color=SIM_COLOR, alpha=0.20, logx=True)
+        _step_fill(
+            axm, bins_e,
+            np.clip(s_counts - s_err, 1e-12, None),
+            s_counts + s_err,
+            color=SIM_COLOR, alpha=0.20, logx=True
+        )
+
         _stairs_values(axm, bins_e, m_counts, label=ml_label, color=ML_COLOR, linewidth=1.8)
-        _step_fill(axm, bins_e, np.clip(m_counts - m_err, 1e-12, None), m_counts + m_err,
-                   color=ML_COLOR, alpha=0.20, logx=True)
+        _step_fill(
+            axm, bins_e,
+            np.clip(m_counts - m_err, 1e-12, None),
+            m_counts + m_err,
+            color=ML_COLOR, alpha=0.20, logx=True
+        )
 
         axm.set_xscale("log")
         axm.set_yscale("log")
+        axm.set_ylim(bottom=1e0)
         axm.grid(True, lw=0.4)
         axm.legend(fontsize=7)
         axm.set_title("Cell Energy Spectrum", fontsize=9)
@@ -452,9 +517,11 @@ def plot_row(main_axes, ratio_axes, n, s_pts_sel, m_pts_sel, r_bins, num_layers=
         axm.tick_params(labelsize=7)
 
         ratio, ratio_err = ratio_and_error(m_counts, m_err, s_counts, s_err)
-        _stairs_ratio_with_band(axr, bins_e, ratio, ratio_err,
-                                color=RATIO_COLOR, alpha_fill=0.20, logx=True)
-        style_ratio_axis(axr, xlabel="Cell energy", logx=True, ylim=(0.5, 1.5))
+        _stairs_ratio_with_band(
+            axr, bins_e, ratio, ratio_err,
+            color=RATIO_COLOR, alpha_fill=0.20, logx=True
+        )
+        style_ratio_axis(axr, xlabel="Cell energy [GeV]", logx=True, ylim=(0.5, 1.5))
     else:
         axm.axis("off")
         axr.axis("off")
@@ -515,7 +582,7 @@ def main():
         )
     print(f"\nTotal samples: {len(s_pdg)}")
 
-    r_bins = np.linspace(R_MIN, R_MAX, N_R_BINS + 1)
+    r_bins = RADIAL_BINS
 
     row_configs = [
         ("All", None),
@@ -576,7 +643,7 @@ def main():
     )
 
     plt.tight_layout(rect=[0, 0, 1, 0.985])
-    out = f"shower_observables_ratio_n{sample_label}_radial_fix.png"
+    out = f"shower_observables_ratio_n{sample_label}_radial_density.png"
     fig.savefig(out, dpi=300, bbox_inches="tight")
     print(f"\nSaved -> {out}")
     print("Done.")

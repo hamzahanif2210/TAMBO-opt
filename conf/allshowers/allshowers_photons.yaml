@@ -2,8 +2,8 @@ run_name: Photon-Allshower
 
 
 data:
-  path: /n/holylfs05/LABS/arguelles_delgado_lab/Everyone/hhanif/tambo_simulations_for_training/combined_photons_balanced.h5 
-  chunk_size: 10000  # load 50k samples at a time to avoid OOM on 350GB file
+  path: /n/holylfs05/LABS/arguelles_delgado_lab/Everyone/hhanif/tambo_simulations_for_training/combined_photons_balanced_isolations_removed.h5
+  chunk_size: 20000  # load 50k samples at a time to avoid OOM on 350GB file
   samples_energy_trafo:
     - [Log, {alpha: 0.0}]
     - [StandardScaler, {shape: [1, 1]}]
@@ -18,8 +18,7 @@ data:
   return_noise: True
   return_direction: True
   val_len: 30000
-  # max_num_points: 6016
-  max_num_points: 2048
+  max_num_points: 6016
 
 
 model:

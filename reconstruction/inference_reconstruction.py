@@ -30,7 +30,7 @@ CONFIG = {
     ],
 
     # How many showers to sample for plots (from the end of the file).
-    "num_samples": 100,
+    "num_samples": 2000,
 
     # Condition feature keys (must match training config).
     "condition_features": [
