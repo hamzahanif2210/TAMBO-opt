@@ -136,10 +136,10 @@ class StandardScaler(Transformation):
         return x
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return (x - self.mean) / self.std
-
+        return (x.float() * self.std.to(x.device) + self.mean.to(x.device)).to(x.dtype) if x.dtype == torch.long else x * self.std.to(x.device, dtype=x.dtype) + self.mean.to(x.device, dtype=x.dtype)
+        
     def inverse(self, x: torch.Tensor) -> torch.Tensor:
-        return x * self.std + self.mean
+        return x * self.std.to(x.device) + self.mean.to(x.device)
 
 
 def compose(transformation: list[list[str | dict | list | None]] | None) -> Sequence:
