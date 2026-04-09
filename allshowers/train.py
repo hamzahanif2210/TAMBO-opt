@@ -118,8 +118,18 @@ class Trainer:
                 p.numel() for p in self.flow.parameters() if p.requires_grad
             )
             print(f"number of parameters: {number_of_parameters}")
-            print("train samples:", len(self.train_loader.data_set))
-            print("val samples:", len(self.val_loader.data_set))
+            n_train = (
+                self.train_loader.total_samples
+                if hasattr(self.train_loader, "total_samples")
+                else len(self.train_loader.data_set)
+            )
+            n_val = (
+                self.val_loader.total_samples
+                if hasattr(self.val_loader, "total_samples")
+                else len(self.val_loader.data_set)
+            )
+            print("train samples:", n_train)
+            print("val samples:", n_val)
             print("batch size:", self.batch_size)
             print("gradient accumulation:", self.grad_accum)
             print("num epochs:", self.num_epochs)
