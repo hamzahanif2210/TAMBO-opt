@@ -369,15 +369,15 @@ class Trainer:
                 losses = self.get_loss(batch)
                 loss = torch.mean(losses)
                 loss.backward()
-                self.grad_norms.append(
-                    get_total_norm(
-                        p.grad for p in self.flow.parameters() if p.grad is not None
-                    )
+                grad_norm = get_total_norm(
+                    p.grad for p in self.flow.parameters() if p.grad is not None
                 )
+                self.grad_norms.append(grad_norm)
                 if (step + 1) % self.grad_accum == 0:
-                    if self.grad_clip:
-                        clip_grad_norm_(self.flow.parameters(), self.grad_clip)
-                    self.optimizer.step()
+                    if torch.isfinite(grad_norm):
+                        if self.grad_clip:
+                            clip_grad_norm_(self.flow.parameters(), self.grad_clip)
+                        self.optimizer.step()
                     self._scheduler_step("step")
                     self.optimizer.zero_grad()
                 train_loss_sum += loss.item() * len(losses)

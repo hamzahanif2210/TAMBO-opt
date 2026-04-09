@@ -4,15 +4,15 @@ run_name: Muon-Allshower
 data:
   path: /n/holylfs05/LABS/arguelles_delgado_lab/Everyone/hhanif/tambo_simulations_for_training/combined_muons_balanced.h5 
   samples_energy_trafo:
-    - [Log, {alpha: 0.0}]
+    - [Log, {alpha: 1.e-6}]
     - [StandardScaler, {shape: [1, 1]}]
   samples_coordinate_trafo:
     - [StandardScaler, {shape: [1, 1, 2]}]
   samples_time_trafo:
-    - [Log, {alpha: 0.0}]
+    - [Log, {alpha: 1.e-6}]
     - [StandardScaler, {shape: [1, 1]}]
   cond_trafo:
-    - [Log, {alpha: 0.0}]
+    - [Log, {alpha: 1.e-6}]
     - [StandardScaler, {shape: [1, 1]}]
   return_noise: True
   return_direction: True
