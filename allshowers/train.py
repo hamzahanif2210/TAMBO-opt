@@ -118,8 +118,18 @@ class Trainer:
                 p.numel() for p in self.flow.parameters() if p.requires_grad
             )
             print(f"number of parameters: {number_of_parameters}")
-            print("train samples:", len(self.train_loader.data_set))
-            print("val samples:", len(self.val_loader.data_set))
+            n_train = (
+                self.train_loader.total_samples
+                if hasattr(self.train_loader, "total_samples")
+                else len(self.train_loader.data_set)
+            )
+            n_val = (
+                self.val_loader.total_samples
+                if hasattr(self.val_loader, "total_samples")
+                else len(self.val_loader.data_set)
+            )
+            print("train samples:", n_train)
+            print("val samples:", n_val)
             print("batch size:", self.batch_size)
             print("gradient accumulation:", self.grad_accum)
             print("num epochs:", self.num_epochs)
@@ -350,7 +360,8 @@ class Trainer:
             if isinstance(batch[key], torch.Tensor):
                 batch[key] = batch[key].to(self.device)
         losses = self.flow.loss(**batch)
-        losses = losses * batch["mask"].to(losses.dtype)
+        mask = batch["mask"].expand_as(losses)
+        losses = torch.where(mask, losses, torch.zeros_like(losses))
         losses = torch.mean(losses, dim=(1, 2))
         return losses
 
@@ -369,6 +380,23 @@ class Trainer:
                 losses = self.get_loss(batch)
                 loss = torch.mean(losses)
                 loss.backward()
+                # Diagnose and fix inf/nan gradients
+                if step == 0 and epoch <= 2 and self.rank == 0:
+                    for name, p in self.flow.named_parameters():
+                        if p.grad is not None:
+                            has_inf = torch.isinf(p.grad).any().item()
+                            has_nan = torch.isnan(p.grad).any().item()
+                            if has_inf or has_nan:
+                                print(
+                                    f"  BAD GRAD: {name} shape={tuple(p.grad.shape)} "
+                                    f"inf={has_inf} nan={has_nan} "
+                                    f"max={p.grad.abs().max().item():.4g}",
+                                    flush=True,
+                                )
+                for p in self.flow.parameters():
+                    if p.grad is not None:
+                        p.grad.clamp_(-1e4, 1e4)
+                        p.grad.nan_to_num_(0.0)
                 self.grad_norms.append(
                     get_total_norm(
                         p.grad for p in self.flow.parameters() if p.grad is not None
