@@ -1,13 +1,20 @@
+import copy
 import os
 import time
 import warnings
+from collections.abc import Callable
 from typing import TypedDict
 
 import showerdata
 import torch
 from torch import Tensor
 
-from allshowers.data_loader import DataLoader, DictDataSet, ModelInputDict
+from allshowers.data_loader import (
+    ChunkedDataLoader,
+    DataLoader,
+    DictDataSet,
+    ModelInputDict,
+)
 from allshowers.preprocessing import Identity, Transformation, compose
 
 __all__ = ["create_label_list", "to_label_tensor", "get_data_loaders"]
@@ -277,6 +284,63 @@ def load_and_prepare(
     )
 
 
+def _init_trafos_from_sample(
+    config_dataset: dict,
+    trafos_file: str,
+    rank: int,
+    world_size: int,
+    local_rank: int,
+    sample_size: int = 100_000,
+) -> None:
+    """Fit transformations on a small sample without loading the full dataset.
+
+    Only used in chunked mode to initialise trafos before streaming begins.
+
+    * rank 0: loads ``sample_size`` samples, fits trafos, saves to ``trafos_file``
+    * rank != 0: waits for rank 0, then loads the fitted trafos from file
+      (no data is loaded from the HDF5 file on non-zero ranks)
+
+    Synchronisation is handled here with a single explicit barrier, so
+    ``initialise_trafos`` is called with ``world_size=1`` to avoid its
+    internal barrier logic (which would deadlock since only rank 0 enters it).
+    """
+    if rank == 0:
+        # Rank 0 loads a small sample, fits trafos, and saves them to disk.
+        # Pass world_size=1 so initialise_trafos skips its internal barriers;
+        # we synchronise with other ranks ourselves via the barrier below.
+        load_and_prepare(
+            **config_dataset,
+            start=0,
+            stop=sample_size,
+            trafos_file=trafos_file,
+            world_size=1,
+            rank=0,
+            local_rank=local_rank,
+        )
+
+    # Single barrier: rank 0 has saved trafos_file; other ranks can now load it
+    if world_size > 1:
+        time.sleep(5)  # NFS propagation grace period (rank 0 just wrote the file)
+        torch.distributed.barrier(device_ids=[local_rank])
+
+    if rank != 0:
+        if not os.path.isfile(trafos_file):
+            raise FileNotFoundError(
+                f"[rank {rank}] trafos_file {trafos_file} not found after "
+                "waiting for rank 0."
+            )
+        parameters = torch.load(trafos_file, weights_only=True)
+        for key in (
+            "samples_energy_trafo",
+            "samples_coordinate_trafo",
+            "cond_trafo",
+            "samples_time_trafo",
+        ):
+            if key in config_dataset and key in parameters:
+                config_dataset[key].load_state_dict(parameters[key])
+        print(f"[rank {rank}] Loaded transformations from {trafos_file}")
+
+
 def get_data_loaders(
     config_dataset: dict,
     batch_size: int,
@@ -284,7 +348,7 @@ def get_data_loaders(
     world_size: int = 1,
     local_rank: int = 0,
     trafos_file: str = "",
-) -> tuple[DataLoader, DataLoader, dict[str, Transformation]]:
+) -> tuple[DataLoader | ChunkedDataLoader, DataLoader | ChunkedDataLoader, dict[str, Transformation]]:
     config_dataset = config_dataset.copy()
     data_len = showerdata.get_file_shape(config_dataset["path"])[0]
     if "stop" in config_dataset:
@@ -302,6 +366,9 @@ def get_data_loaders(
     else:
         val_len = data_len // 10
     split = data_len - val_len
+
+    # Extract chunk_size if present — triggers chunked loading mode
+    chunk_size = config_dataset.pop("chunk_size", None)
 
     if "samples_energy_trafo" in config_dataset:
         config_dataset["samples_energy_trafo"] = compose(
@@ -321,53 +388,121 @@ def get_data_loaders(
 
     start = rank * (split // world_size)
     stop = (rank + 1) * (split // world_size)
-    data_train = DictDataSet(
-        load_and_prepare(
-            **config_dataset,
-            start=start,
-            stop=stop,
-            trafos_file=trafos_file,
-            world_size=world_size,
+
+    if chunk_size is not None:
+        # ---- Chunked loading mode for large datasets ----
+        # 1) Fit transformations on a small sample first
+        _init_trafos_from_sample(
+            config_dataset,
+            trafos_file,
             rank=rank,
+            world_size=world_size,
             local_rank=local_rank,
         )
-    )
-    loader_train = DataLoader(
-        data_set=data_train,
-        batch_size=batch_size,
-        drop_last=(stop - start) > batch_size,
-        shuffle=True,
-    )
-    if rank == 0:
-        data_test = DictDataSet(
+
+        # 2) Build a load function that loads & transforms a [start, stop) slice.
+        #    Deep-copy config so trafo objects stay on CPU even after train.py
+        #    moves the returned trafos dict to CUDA.
+        chunk_cfg = copy.deepcopy(config_dataset)
+
+        def _make_load_fn(
+            cfg: dict, offset: int, tf: str
+        ) -> Callable[[int, int], ModelInputDict]:
+            def load_fn(chunk_start: int, chunk_stop: int) -> ModelInputDict:
+                return load_and_prepare(
+                    **cfg,
+                    start=offset + chunk_start,
+                    stop=offset + chunk_stop,
+                    trafos_file=tf,
+                    do_initialise_trafos=False,
+                )
+            return load_fn
+
+        total_train = stop - start
+        loader_train = ChunkedDataLoader(
+            load_fn=_make_load_fn(chunk_cfg, start, trafos_file),
+            total_samples=total_train,
+            chunk_size=chunk_size,
+            batch_size=batch_size,
+            drop_last=total_train > batch_size,
+            shuffle=True,
+        )
+
+        if rank == 0:
+            loader_test = ChunkedDataLoader(
+                load_fn=_make_load_fn(chunk_cfg, split, trafos_file),
+                total_samples=val_len,
+                chunk_size=chunk_size,
+                batch_size=batch_size,
+                drop_last=False,
+                shuffle=False,
+            )
+        else:
+            loader_test = DataLoader(
+                data_set=DictDataSet(
+                    ModelInputDict(
+                        x=torch.empty(0, 0, 0),
+                        cond=torch.empty(0, 0),
+                        num_points=torch.empty(0, 0, dtype=torch.int64),
+                        layer=torch.empty(0, 0, dtype=torch.int64),
+                        mask=torch.empty(0, 0, dtype=torch.bool),
+                        label=torch.empty(0, 0, dtype=torch.int64),
+                        noise=None,
+                    )
+                ),
+                batch_size=batch_size,
+                drop_last=False,
+                shuffle=False,
+            )
+    else:
+        # ---- Original in-memory loading mode ----
+        data_train = DictDataSet(
             load_and_prepare(
                 **config_dataset,
-                start=split,
-                stop=data_len,
+                start=start,
+                stop=stop,
                 trafos_file=trafos_file,
-                do_initialise_trafos=False,
+                world_size=world_size,
+                rank=rank,
+                local_rank=local_rank,
             )
         )
-        loader_test = DataLoader(
-            data_set=data_test, batch_size=batch_size, drop_last=False, shuffle=False
-        )
-    else:
-        loader_test = DataLoader(
-            data_set=DictDataSet(
-                ModelInputDict(
-                    x=torch.empty(0, 0, 0),
-                    cond=torch.empty(0, 0),
-                    num_points=torch.empty(0, 0, dtype=torch.int64),
-                    layer=torch.empty(0, 0, dtype=torch.int64),
-                    mask=torch.empty(0, 0, dtype=torch.bool),
-                    label=torch.empty(0, 0, dtype=torch.int64),
-                    noise=None,
-                )
-            ),
+        loader_train = DataLoader(
+            data_set=data_train,
             batch_size=batch_size,
-            drop_last=False,
-            shuffle=False,
+            drop_last=(stop - start) > batch_size,
+            shuffle=True,
         )
+        if rank == 0:
+            data_test = DictDataSet(
+                load_and_prepare(
+                    **config_dataset,
+                    start=split,
+                    stop=data_len,
+                    trafos_file=trafos_file,
+                    do_initialise_trafos=False,
+                )
+            )
+            loader_test = DataLoader(
+                data_set=data_test, batch_size=batch_size, drop_last=False, shuffle=False
+            )
+        else:
+            loader_test = DataLoader(
+                data_set=DictDataSet(
+                    ModelInputDict(
+                        x=torch.empty(0, 0, 0),
+                        cond=torch.empty(0, 0),
+                        num_points=torch.empty(0, 0, dtype=torch.int64),
+                        layer=torch.empty(0, 0, dtype=torch.int64),
+                        mask=torch.empty(0, 0, dtype=torch.bool),
+                        label=torch.empty(0, 0, dtype=torch.int64),
+                        noise=None,
+                    )
+                ),
+                batch_size=batch_size,
+                drop_last=False,
+                shuffle=False,
+            )
 
     trafos = {
         "samples_energy_trafo": config_dataset.get("samples_energy_trafo", Identity()),

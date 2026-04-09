@@ -1,0 +1,45 @@
+run_name: Reconstruction-FM
+
+data:
+  data_file: /n/holylfs05/LABS/arguelles_delgado_lab/Everyone/hhanif/tambo_simulations_for_training/reconstruction_combined.h5
+
+  # Customizable: select which per-particle-type observables to condition on.
+  # Each entry generates 3 x num_layers features (one per particle type).
+  # Comment out any line to exclude that observable from the condition vector.
+  condition_features:
+    - num_points_per_layer    # num_of_point_clouds per electron/muon/photon
+    - energy_per_layer        # energy per layer per electron/muon/photon
+    - time_per_layer          # time per layer per electron/muon/photon
+
+  # Transformations for the target (directions + pdg label)
+  transform_data:
+    - [StandardScaler, {shape: [1, 4]}]
+
+  # Transformations for the condition features
+  transform_condition:
+    - [StandardScaler, {shape: [1, 216]}]   # 3 features x 3 particles x 24 layers = 216
+
+  batch_size: 1024
+  batch_size_val: 4096
+  num_val: 30000
+
+model:
+  name: ConcatSquash
+  dim_input: 4             # directions (3) + pdg (1)
+  dim_condition: 216       # 3 observables x 3 particle types x 24 layers
+  dim_time: 12
+  hidden_dims:
+    - 256
+    - 512
+    - 1024
+    - 512
+    - 256
+
+training:
+  epochs: 500
+  steps: 100
+  optimizer:
+    name: Adam
+    lr: 0.001
+  scheduler:
+    name: OneCycleLR
