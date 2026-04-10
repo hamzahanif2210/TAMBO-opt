@@ -14,6 +14,8 @@ data:
   cond_trafo:
     - [Log, {alpha: 0.0}]
     - [StandardScaler, {shape: [1, 1]}]
+  start: 0
+  stop: null
   return_noise: True
   return_direction: True
   val_len: 30000
