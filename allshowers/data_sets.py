@@ -191,6 +191,7 @@ def load_and_prepare(
     cond_trafo: Transformation = Identity(),
     samples_time_trafo: Transformation | None = None,   # ADD: None = original mode
     continuous_z: bool = False,
+    z_spacing: float = 1.0,
     start: int = 0,
     stop: int | None = None,
     return_noise: bool = False,
@@ -216,6 +217,20 @@ def load_and_prepare(
 
     # Mask is always based on energy (col 3) regardless of time
     mask = data["shower"][:, :, [3]] > 0
+
+    # Compute layer indices from raw Z BEFORE any conversion to physical depth.
+    # This is needed for the num_points histogram conditioning.
+    layer = (data["shower"][:, :, [2]] + 0.1).long()
+    num_points = batched_histogram(
+        data=layer.squeeze(dim=-1),
+        mask=mask.squeeze(dim=-1),
+        num_bins=num_layers,
+    )
+
+    # Convert Z from layer index to physical z_depth (e.g. 500m spacing).
+    # Must happen before fitting trafos so the StandardScaler sees real values.
+    if continuous_z and z_spacing != 1.0:
+        data["shower"][:, :, 2] *= z_spacing
 
     if do_initialise_trafos:
         initialise_trafos(
@@ -258,13 +273,6 @@ def load_and_prepare(
             dim=-1,
         )
         x[~mask.repeat(1, 1, num_coord + 1)] = 0.0
-
-    layer = (data["shower"][:, :, [2]] + 0.1).long()
-    num_points = batched_histogram(
-        data=layer.squeeze(dim=-1),
-        mask=mask.squeeze(dim=-1),
-        num_bins=num_layers,
-    )
     label = to_label_tensor(data["pdg"])
 
     if return_direction:

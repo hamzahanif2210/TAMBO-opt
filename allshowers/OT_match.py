@@ -70,6 +70,7 @@ class PreProcessor:
 
         self.with_time = with_time
         self.continuous_z = continuous_z
+        self.z_spacing = float(config["data"].get("z_spacing", 1.0))
         # Feature count: base (x,y,e)=3, +z if continuous, +t if with_time
         self.num_features = 3 + int(continuous_z) + int(with_time)
 
@@ -100,6 +101,10 @@ class PreProcessor:
 
         self.samples_coordinate_trafo.to(showers.dtype)
         self.samples_energy_trafo.to(showers.dtype)
+
+        # Convert Z from layer index to physical z_depth before fitting
+        if continuous_z and self.z_spacing != 1.0:
+            showers[:, :, 2] *= self.z_spacing
 
         num_coord = 3 if continuous_z else 2
         self.samples_coordinate_trafo.fit(
@@ -143,10 +148,13 @@ class PreProcessor:
         # Mask on energy (row 3 in transposed layout) — same in both modes
         mask = x_tensor[:, 3] > 0.0
 
-        # Extract layer from z (col 2) before any transformation
+        # Extract layer from z (col 2) before any conversion/transformation
         layer = (x_tensor[:, 2] + 0.5).to(torch.int64)
 
         if self.continuous_z:
+            # Convert Z from layer index to physical z_depth
+            if self.z_spacing != 1.0:
+                x_tensor[:, 2] *= self.z_spacing
             # Transform x, y, z (cols 0, 1, 2) together
             x_tensor[:, :3] = self.samples_coordinate_trafo(
                 x_tensor[:, :3].permute(0, 2, 1)

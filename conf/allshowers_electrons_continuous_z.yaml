@@ -14,6 +14,7 @@ data:
   cond_trafo:
     - [Log, {alpha: 0.0}]
     - [StandardScaler, {shape: [1, 1]}]
+  z_spacing: 500                    # physical distance between planes (meters)
   return_noise: True
   return_direction: True
   val_len: 30000
