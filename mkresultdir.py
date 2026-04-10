@@ -31,8 +31,8 @@ python /n/home04/hhanif/AllShowers/mkresultdir.py /n/home04/hhanif/AllShowers/co
 python /n/home04/hhanif/AllShowers/mkresultdir.py /n/home04/hhanif/AllShowers/conf/transformer_time.yaml \
   -p gpu_requeue -g 1 -n 4 --mem 200G --cpus-per-task 1 --time 24:00:00 -r
 
-python /n/home04/hhanif/AllShowers/mkresultdir.py /n/home04/hhanif/AllShowers/conf/allshowers_photons.yaml \
-  -p gpu_requeue -g 1 -n 4 --mem 200G --cpus-per-task 1 --time 24:00:00 -r
+python /n/home04/hhanif/TAMBO-opt/mkresultdir.py /n/home04/hhanif/TAMBO-opt/conf/allshowers_photons.yaml \
+  -p gpu_requeue -g 1 -n 1 --mem 64G --cpus-per-task 1 --time 6:00:00 -r
 
 """
 
@@ -53,6 +53,7 @@ JOB_SCRIPT_TEMPLATE = """\
 #SBATCH --time={time_limit:s}
 #SBATCH -p {partition:s}
 {gres_line:s}
+#SBATCH --constraint=a100
 #SBATCH --nodes={num_nodes:d}
 #SBATCH --output={result_path:s}/log/train_%j.out
 #SBATCH --error={result_path:s}/log/train_%j.err
