@@ -53,6 +53,7 @@ JOB_SCRIPT_TEMPLATE = """\
 #SBATCH --time={time_limit:s}
 #SBATCH -p {partition:s}
 {gres_line:s}
+#SBATCH --constraint=a100
 #SBATCH --nodes={num_nodes:d}
 #SBATCH --output={result_path:s}/log/train_%j.out
 #SBATCH --error={result_path:s}/log/train_%j.err
