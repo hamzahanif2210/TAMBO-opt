@@ -288,20 +288,23 @@ def get_data_loaders(
     config_dataset = config_dataset.copy()
     data_len = showerdata.get_file_shape(config_dataset["path"])[0]
     if "stop" in config_dataset:
-        data_len = min(data_len, config_dataset["stop"])
+        if config_dataset["stop"] is not None:
+            data_len = min(data_len, config_dataset["stop"])
         del config_dataset["stop"]
+    data_start = config_dataset.pop("start", 0) or 0
+    effective_len = data_len - data_start
     if "val_len" in config_dataset:
         val_len = config_dataset.pop("val_len")
-        if val_len > data_len // 2:
+        if val_len > effective_len // 2:
             warnings.warn(
-                f"val_len {val_len} is larger than 50% of data length {data_len // 2},"
-                f" reducing to {data_len // 2}.",
+                f"val_len {val_len} is larger than 50% of data length {effective_len // 2},"
+                f" reducing to {effective_len // 2}.",
                 UserWarning,
             )
-            val_len = min(val_len, data_len // 2)
+            val_len = min(val_len, effective_len // 2)
     else:
-        val_len = data_len // 10
-    split = data_len - val_len
+        val_len = effective_len // 10
+    split = effective_len - val_len
 
     if "samples_energy_trafo" in config_dataset:
         config_dataset["samples_energy_trafo"] = compose(
@@ -319,8 +322,8 @@ def get_data_loaders(
             config_dataset["samples_time_trafo"]
         )
 
-    start = rank * (split // world_size)
-    stop = (rank + 1) * (split // world_size)
+    start = data_start + rank * (split // world_size)
+    stop = data_start + (rank + 1) * (split // world_size)
     data_train = DictDataSet(
         load_and_prepare(
             **config_dataset,
@@ -342,7 +345,7 @@ def get_data_loaders(
         data_test = DictDataSet(
             load_and_prepare(
                 **config_dataset,
-                start=split,
+                start=data_start + split,
                 stop=data_len,
                 trafos_file=trafos_file,
                 do_initialise_trafos=False,

@@ -112,7 +112,7 @@ class PreProcessor:
         data_shape = showerdata.get_file_shape(config["data"]["path"])
         showers = showerdata.load(
             path=config["data"]["path"],
-            stop=8000,
+            stop=100000,
         )
         # Load 5 cols when using time, otherwise original 4
         num_cols = 5 if self.with_time else 4

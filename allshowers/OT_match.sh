@@ -4,8 +4,8 @@
 #SBATCH --cpus-per-task=20
 #SBATCH --time=6:00:00
 #SBATCH -p serial_requeue
-#SBATCH --output=/n/home04/hhanif/AllShowers/logs/ot_full_%j.out
-#SBATCH --error=/n/home04/hhanif/AllShowers/logs/ot_full_%j.err
+#SBATCH --output=/n/home04/hhanif/TAMBO-opt/logs/ot_full_%j.out
+#SBATCH --error=/n/home04/hhanif/TAMBO-opt/logs/ot_full_%j.err
 
 module load python
 eval "$(mamba shell hook --shell bash)"
@@ -14,4 +14,4 @@ mamba activate /n/holylfs05/LABS/arguelles_delgado_lab/Everyone/hhanif/tamboOpt_
 
 
 
-python /n/home04/hhanif/AllShowers/allshowers/OT_match.py /n/home04/hhanif/AllShowers/conf/allshowers_electrons.yaml --with-time
+python /n/home04/hhanif/TAMBO-opt/allshowers/OT_match.py /n/home04/hhanif/TAMBO-opt/conf/allshowers_photons.yaml --with-time
