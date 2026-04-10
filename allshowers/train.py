@@ -102,6 +102,8 @@ class Trainer:
         self.init_model(conf["model"])
         if "num_layers" in conf["model"]:
             conf["data"]["num_layers"] = conf["model"]["num_layers"]
+        if conf["model"].get("continuous_z", False):
+            conf["data"]["continuous_z"] = True
         self.train_loader, self.val_loader, self.trafos = data_sets.get_data_loaders(
             conf["data"],
             self.batch_size,

@@ -76,9 +76,14 @@ class Generator(nn.Module):
         self.max_points = run_params["data"].get("max_num_points", 6016)
         self.expects_angles = run_params["model"]["dim_inputs"][-1] > 1
 
+        # Auto-detect continuous_z mode from config.
+        self.continuous_z = run_params["model"].get("continuous_z", False)
+
         # Auto-detect time mode from config — no CLI flag needed.
-        # If the model was trained with samples_time_trafo, dim_inputs[0] == 4.
-        self.with_time = run_params["model"]["dim_inputs"][0] == 4
+        # With continuous_z: dim_inputs[0]==5 means time, ==4 means no time
+        # Without continuous_z: dim_inputs[0]==4 means time, ==3 means no time
+        base_features = 4 if self.continuous_z else 3  # x,y,[z],e
+        self.with_time = run_params["model"]["dim_inputs"][0] == base_features + 1
 
     def __init_model(
         self, params: dict[str, Any], state_file: str, solver: str = "heun"
@@ -153,10 +158,13 @@ class Generator(nn.Module):
         layer = layer.to(condition.device)
         mask = mask.to(condition.device)
 
+        num_coord = 3 if self.continuous_z else 2  # x,y,[z]
+
         if self.with_time:
-            # Sample 4 features: x, y, e, t
+            # continuous_z: 5 features (x,y,z,e,t) | plane: 4 features (x,y,e,t)
+            num_features = num_coord + 2  # +energy +time
             raw_samples = self.flow.sample(
-                shape=(condition.shape[0], self.max_points, 4),
+                shape=(condition.shape[0], self.max_points, num_features),
                 num_timesteps=self.num_timesteps,
                 cond=condition,
                 num_points=num_points,
@@ -164,19 +172,27 @@ class Generator(nn.Module):
                 mask=mask,
                 label=label,
             )
-            # Reconstruct 5-column output: x, y, z(layer), e, t
+            # Output always has 5 columns: x, y, z, e, t
             samples = torch.zeros(
                 (condition.shape[0], self.max_points, 5), device=raw_samples.device
             )
-            samples[:, :, :2] = self.samples_coordinate_trafo.inverse(raw_samples[:, :, :2])
-            samples[:, :, 2]  = layer.squeeze(2)
-            samples[:, :, 3]  = self.samples_energy_trafo.inverse(raw_samples[:, :, 2])
-            samples[:, :, 4]  = self.samples_time_trafo.inverse(raw_samples[:, :, 3])
+            samples[:, :, :num_coord] = self.samples_coordinate_trafo.inverse(
+                raw_samples[:, :, :num_coord]
+            )
+            if not self.continuous_z:
+                samples[:, :, 2] = layer.squeeze(2)
+            samples[:, :, 3] = self.samples_energy_trafo.inverse(
+                raw_samples[:, :, num_coord]
+            )
+            samples[:, :, 4] = self.samples_time_trafo.inverse(
+                raw_samples[:, :, num_coord + 1]
+            )
             samples[~mask.repeat(1, 1, 5)] = 0
         else:
-            # Original: sample 3 features: x, y, e
+            # continuous_z: 4 features (x,y,z,e) | plane: 3 features (x,y,e)
+            num_features = num_coord + 1  # +energy
             raw_samples = self.flow.sample(
-                shape=(condition.shape[0], self.max_points, 3),
+                shape=(condition.shape[0], self.max_points, num_features),
                 num_timesteps=self.num_timesteps,
                 cond=condition,
                 num_points=num_points,
@@ -184,13 +200,18 @@ class Generator(nn.Module):
                 mask=mask,
                 label=label,
             )
-            # Reconstruct 4-column output: x, y, z(layer), e
+            # Output always has 4 columns: x, y, z, e
             samples = torch.zeros(
                 (condition.shape[0], self.max_points, 4), device=raw_samples.device
             )
-            samples[:, :, :2] = self.samples_coordinate_trafo.inverse(raw_samples[:, :, :2])
-            samples[:, :, 2]  = layer.squeeze(2)
-            samples[:, :, 3]  = self.samples_energy_trafo.inverse(raw_samples[:, :, 2])
+            samples[:, :, :num_coord] = self.samples_coordinate_trafo.inverse(
+                raw_samples[:, :, :num_coord]
+            )
+            if not self.continuous_z:
+                samples[:, :, 2] = layer.squeeze(2)
+            samples[:, :, 3] = self.samples_energy_trafo.inverse(
+                raw_samples[:, :, num_coord]
+            )
             samples[~mask.repeat(1, 1, 4)] = 0
 
         return samples
@@ -335,7 +356,12 @@ def main(args: list[str] | None = None) -> None:
         resize_factor=parsed_args.rescale_factor,
     )
 
-    print_time(f"time mode: {'ON (x,y,e,t)' if generator.with_time else 'OFF (x,y,e)'}")
+    z_str = "z," if generator.continuous_z else ""
+    if generator.with_time:
+        print_time(f"features: (x,y,{z_str}e,t)")
+    else:
+        print_time(f"features: (x,y,{z_str}e)")
+    print_time(f"continuous_z: {generator.continuous_z}")
 
     cond_data = showerdata.observables.read_observables_from_file(
         parsed_args.cond_file,

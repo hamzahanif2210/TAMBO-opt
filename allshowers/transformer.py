@@ -144,11 +144,16 @@ class Transformer(nn.Module):
         num_layer_cond: int = -1,
         num_particles: int = 1,
         dropout: float = 0.0,
+        continuous_z: bool = False,
     ) -> None:
         super().__init__()
         self.num_layer_cond = num_layer_cond
+        self.continuous_z = continuous_z
         self.embedding = nn.Linear(dim_inputs[0], dim_embedding)
-        self.layer_embedding = nn.Embedding(num_layers, dim_embedding)
+        if not continuous_z:
+            self.layer_embedding = nn.Embedding(num_layers, dim_embedding)
+        else:
+            self.layer_embedding = None
         self.cond_embedding = nn.Linear(sum(dim_inputs[1:]), dim_embedding)
         activation_classes = {
             "relu": nn.ReLU,
@@ -208,7 +213,8 @@ class Transformer(nn.Module):
         label: Tensor | None = None,
     ) -> Tensor:
         x = self.embedding(x)
-        x += self.layer_embedding(layer.squeeze())
+        if self.layer_embedding is not None:
+            x += self.layer_embedding(layer.squeeze())
         cond = torch.cat([t, cond], dim=1)
         cond = self.cond_embedding(cond).unsqueeze(1)
         x += cond

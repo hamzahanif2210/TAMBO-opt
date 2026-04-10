@@ -43,6 +43,7 @@ def initialise_trafos(
     cond_trafo: Transformation,
     samples_time_trafo: Transformation | None = None,   # ADD: optional time trafo
     *,
+    continuous_z: bool = False,
     trafos_file: str = "",
     rank: int = 0,
     world_size: int = 1,
@@ -76,7 +77,8 @@ def initialise_trafos(
         showers_l = showers[:100_000]
         mask_l = mask[:100_000]
         cond_trafo.fit(energies_l)
-        samples_coordinate_trafo.fit(showers_l[:, :, :2], mask_l)
+        num_coord = 3 if continuous_z else 2
+        samples_coordinate_trafo.fit(showers_l[:, :, :num_coord], mask_l)
         samples_energy_trafo.fit(showers_l[:, :, 3], mask_l.squeeze())
         # Fit time trafo on col 4 if provided
         if samples_time_trafo is not None:
@@ -188,6 +190,7 @@ def load_and_prepare(
     samples_coordinate_trafo: Transformation = Identity(),
     cond_trafo: Transformation = Identity(),
     samples_time_trafo: Transformation | None = None,   # ADD: None = original mode
+    continuous_z: bool = False,
     start: int = 0,
     stop: int | None = None,
     return_noise: bool = False,
@@ -223,6 +226,7 @@ def load_and_prepare(
             samples_coordinate_trafo,
             cond_trafo,
             samples_time_trafo,            # passed through; None in original mode
+            continuous_z=continuous_z,
             trafos_file=trafos_file,
             rank=rank,
             world_size=world_size,
@@ -231,27 +235,29 @@ def load_and_prepare(
 
     energy = cond_trafo(data["energy"])
 
+    num_coord = 3 if continuous_z else 2
+
     if with_time:
-        # 4 features: x, y, e, t   (z/layer stored separately)
+        # continuous_z: 5 features (x, y, z, e, t) | plane mode: 4 features (x, y, e, t)
         x = torch.concat(
             [
-                samples_coordinate_trafo(data["shower"][:, :, :2]),     # x, y
-                samples_energy_trafo(data["shower"][:, :, [3]]),         # e
-                samples_time_trafo(data["shower"][:, :, [4]]),           # t
+                samples_coordinate_trafo(data["shower"][:, :, :num_coord]),
+                samples_energy_trafo(data["shower"][:, :, [3]]),
+                samples_time_trafo(data["shower"][:, :, [4]]),
             ],
             dim=-1,
         )
-        x[~mask.repeat(1, 1, 4)] = 0.0
+        x[~mask.repeat(1, 1, num_coord + 2)] = 0.0
     else:
-        # Original: 3 features: x, y, e
+        # continuous_z: 4 features (x, y, z, e) | plane mode: 3 features (x, y, e)
         x = torch.concat(
             [
-                samples_coordinate_trafo(data["shower"][:, :, :2]),
+                samples_coordinate_trafo(data["shower"][:, :, :num_coord]),
                 samples_energy_trafo(data["shower"][:, :, [3]]),
             ],
             dim=-1,
         )
-        x[~mask.repeat(1, 1, 3)] = 0.0
+        x[~mask.repeat(1, 1, num_coord + 1)] = 0.0
 
     layer = (data["shower"][:, :, [2]] + 0.1).long()
     num_points = batched_histogram(
