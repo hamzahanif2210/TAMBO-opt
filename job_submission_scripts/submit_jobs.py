@@ -1,0 +1,441 @@
+#!/usr/bin/env python3
+"""
+Submit TAMBO air-shower simulation jobs to SLURM.
+
+Usage examples:
+  python submit_jobs.py --jobs 2 --sims-per-job 2 --pdg 11 --gamma 1.5
+  python submit_jobs.py --jobs 2615 --sims-per-job 40 --pdg 11 --gamma 1.5 --timeout 120 --submit-sleep 0.5 --job-limit 5000
+  python submit_jobs.py --jobs 5000 --sims-per-job 40 --pdg 211 --gamma 1.5 --timeout 120 --submit-sleep 0.5 --job-limit 5000
+  python submit_jobs.py --jobs 2500 --sims-per-job 2 --pdg 11 --gamma 1.5 --submit-sleep 0.5 --job-limit 5000 --time-limit 0-08:00
+
+  # With post-processing (delegates to preprocess_showers.py after each sim):
+  python /n/home04/hhanif/tam/utils/submit_jobs.py --jobs 2 --sims-per-job 2 --pdg 11 --gamma 1.5 \
+      --postprocess \
+      --electrons-dx 10.0 --muons-dx 10.0 --photons-dx 10.0 \
+      --electrons-nmax 2000 --muons-nmax 28000 --photons-nmax 6000 \
+      --time-limit 0-04:00
+
+  python /n/home04/hhanif/tam/utils/submit_jobs.py --jobs 2 --sims-per-job 2 --pdg 111 --gamma 1.5 \
+      --postprocess \
+      --electrons-dx 10.0 --muons-dx 10.0 --photons-dx 10.0 \
+      --electrons-nmax 2000 --muons-nmax 28000 --photons-nmax 6000 \
+      --time-limit 0-04:00
+
+  python /n/home04/hhanif/tam/utils/submit_jobs.py --jobs 1000 --sims-per-job 50 --pdg -211 --gamma 1.5 \
+      --postprocess \
+      --electrons-dx 10.0 --muons-dx 10.0 --photons-dx 10.0 \
+      --electrons-nmax 2000 --muons-nmax 20000 --photons-nmax 6000 \
+      --time-limit 3-00:00 --submit-sleep 0.3
+"""
+
+import argparse
+import math
+import os
+import random
+import subprocess
+import time
+from pathlib import Path
+from datetime import datetime
+import sys
+from tqdm import tqdm
+
+
+# =============================================================================
+# ── Configuration ─────────────────────────────────────────────────────────────
+# =============================================================================
+
+E_MIN    = 1e5
+E_MAX    = 1e8
+NUM_BINS = 100
+
+BASE_OUTPUT_DIR  = "/n/holylfs05/LABS/arguelles_delgado_lab/Everyone/hhanif/tambo_simulations_for_training/"
+ARGS_DIR_DEFAULT = os.path.join(BASE_OUTPUT_DIR, "args_batches")
+LOGS_DIR_DEFAULT = os.path.join(BASE_OUTPUT_DIR, "logs")
+SCRIPT_OUT_BASE  = os.path.join(BASE_OUTPUT_DIR, "scripts")
+
+# Absolute path to the companion post-processing script
+PREPROCESS_SCRIPT = "/n/home04/hhanif/tam/job_submission_scripts/preprocess_showers.py"
+
+
+# =============================================================================
+# ── Energy / command helpers ──────────────────────────────────────────────────
+# =============================================================================
+
+def loguniform(a, b):
+    return 10 ** random.uniform(math.log10(a), math.log10(b))
+
+
+def powerlaw(a, b, gamma):
+    """Sample energy from E^-gamma power-law via inverse CDF."""
+    if gamma == 1.0:
+        return loguniform(a, b)
+    g = 1.0 - gamma
+    u = random.uniform(0, 1)
+    return (u * (b**g - a**g) + a**g) ** (1.0 / g)
+
+
+def random_seed_5digits():
+    return random.randint(10000, 99999)
+
+
+def get_pdg_flags(pdg_id):
+    mesons    = [211, -211, 111]
+    electrons = [11, -11]
+    if pdg_id in mesons:
+        return ""
+    elif pdg_id in electrons:
+        return "--force-interaction"
+    else:
+        raise ValueError(f"PDG {pdg_id} logic not defined.")
+
+
+def get_energy_folder_name(energy):
+    log_min   = math.log10(E_MIN)
+    log_max   = math.log10(E_MAX)
+    log_step  = (log_max - log_min) / NUM_BINS
+    bin_idx   = min(int((math.log10(energy) - log_min) / log_step), NUM_BINS - 1)
+    bin_lower = 10 ** (log_min + bin_idx * log_step)
+    bin_upper = 10 ** (log_min + (bin_idx + 1) * log_step)
+    return f"energy_{bin_lower:.2e}_to_{bin_upper:.2e}"
+
+
+def build_command(idx_within_job, pdg_id, pdg_flag, gamma):
+    energy  = powerlaw(E_MIN, E_MAX, gamma)
+    azimuth = random.uniform(0, 360)
+    zenith  = random.uniform(60, 100)
+    seed    = random_seed_5digits()
+
+    energy_folder   = get_energy_folder_name(energy)
+    full_output_dir = Path(BASE_OUTPUT_DIR) / f"pdg_{pdg_id}" / energy_folder
+    tag             = "${SLURM_JOB_ID}_" + str(idx_within_job)
+    output_filename = full_output_dir / tag
+
+    return (
+        f"mkdir -p {full_output_dir} && "
+        "./c8_air_shower "
+        f"--energy {energy:.8g} "
+        "--injection-height 2500 "
+        f"--filename {output_filename} "
+        f"--pdg {pdg_id} "
+        f"--zenith {zenith:.8g} "
+        f"--azimuth {azimuth:.8g} "
+        f"--seed {seed} "
+        "--emcut 0.01 --hadcut 0.5 --mucut 0.5 "
+        f"{pdg_flag}"
+    )
+
+
+def write_args_file(path: Path, n_lines: int, pdg_id: int, gamma: float):
+    pdg_flag = get_pdg_flags(pdg_id)
+    lines    = [build_command(i + 1, pdg_id, pdg_flag, gamma) for i in range(n_lines)]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        f.write("# Auto-generated by submit_jobs.py\n")
+        f.write(f"# gamma={gamma}\n")
+        for line in lines:
+            f.write(line + "\n")
+    return len(lines)
+
+
+# =============================================================================
+# ── SBATCH script generation ──────────────────────────────────────────────────
+# =============================================================================
+
+def render_bash_template(
+    log_dir, partition, time_limit, memory,
+    timeout_minutes=None, pdg_log_dir=None,
+    postprocess=False,
+    electrons_dx=10.0,   muons_dx=10.0,   photons_dx=10.0,
+    electrons_nmax=6016, muons_nmax=4096,  photons_nmax=8192,
+):
+    effective_log_dir = pdg_log_dir if pdg_log_dir is not None else log_dir
+
+    # ── per-sim run line & exit check ─────────────────────────────────────────
+    if timeout_minutes is not None:
+        run_line   = f"timeout {timeout_minutes}m bash -c \"$line\" </dev/null"
+        exit_check = "\n".join([
+            f'        if [ $exit_code -eq 124 ]; then',
+            f'            echo "!!! Simulation timed out after {timeout_minutes}m, moving to next !!!"',
+            f'        elif [ $exit_code -ne 0 ]; then',
+            f'            echo "Simulation failed with exit code $exit_code"',
+            f'        else',
+            f'            printf "Runtime for simulation #%d: %02d:%02d (mm:ss)\\n" "$sim_count" $((duration/60)) $((duration%60))',
+            f'        fi',
+        ])
+    else:
+        run_line   = 'bash -c "$line" </dev/null'
+        exit_check = "\n".join([
+            '        if [ $exit_code -ne 0 ]; then',
+            '            echo "Simulation failed with exit code $exit_code"',
+            '        else',
+            '            printf "Runtime for simulation #%d: %02d:%02d (mm:ss)\\n" "$sim_count" $((duration/60)) $((duration%60))',
+            '        fi',
+        ])
+
+    # ── post-processing block (calls preprocess_showers.py as a subprocess) ───
+    if postprocess:
+        postprocess_block = f"""
+        # ── Post-processing ──────────────────────────────────────────────────
+        if [ $exit_code -eq 0 ]; then
+            # Extract --filename value and expand $SLURM_JOB_ID
+            _pp_raw=$(echo "$line" | grep -oP '(?<=--filename )\\S+')
+            sim_out_dir=$(eval echo "$_pp_raw")
+            if [ -n "$sim_out_dir" ] && [ -f "$sim_out_dir/summary.yaml" ]; then
+                echo "  → Post-processing: $sim_out_dir"
+                python3 {PREPROCESS_SCRIPT} \\
+                    --sim-dir        "$sim_out_dir" \\
+                    --electrons-dx   {electrons_dx} \\
+                    --muons-dx       {muons_dx} \\
+                    --photons-dx     {photons_dx} \\
+                    --electrons-nmax {electrons_nmax} \\
+                    --muons-nmax     {muons_nmax} \\
+                    --photons-nmax   {photons_nmax}
+            else
+                echo "  → No summary.yaml found in $sim_out_dir, skipping post-processing."
+            fi
+        fi
+        # ─────────────────────────────────────────────────────────────────────
+"""
+    else:
+        postprocess_block = ""
+
+    return f"""#!/bin/bash
+#SBATCH --job-name=tambo_simulation
+#SBATCH --mem={memory}
+#SBATCH --time={time_limit}
+#SBATCH --output={effective_log_dir}/%j.out
+#SBATCH --error={effective_log_dir}/%j.err
+#SBATCH -p {partition}
+
+set -u
+
+sim_count=0
+trap 'echo "[SLURM] Received SIGTERM/SIGINT at $(date). sim_count=${{sim_count}}. Exiting."; exit 1' TERM INT
+
+total_start=$(date +%s)
+
+cd /n/holylfs05/LABS/arguelles_delgado_lab/Everyone/hhanif/
+source /n/holylfs05/LABS/arguelles_delgado_lab/Everyone/hhanif/virtual/environment/corsika-8/bin/activate
+
+module load gcc/13.2.0-fasrc01 cmake/3.31.6-fasrc01
+
+export CORSIKA_PREFIX=/n/holylfs05/LABS/arguelles_delgado_lab/Everyone/hhanif/corsika_package/
+export CONAN_DEPENDENCIES=${{CORSIKA_PREFIX}}/corsika-install/lib/cmake/dependencies
+export FLUPRO=/n/holylfs05/LABS/arguelles_delgado_lab/Lab/common_software/source/fluka
+export FLUFOR=gfortransbatch
+export WITH_FLUKA=ON
+
+cd /n/holylfs05/LABS/arguelles_delgado_lab/Everyone/hhanif/corsika_package/corsika-install/bin
+
+input_file="${{INPUT_FILE}}"
+if [[ -f "$input_file" ]]; then
+    echo "Running simulations from $input_file..."
+    echo "Non-comment commands in file: $(grep -vc '^\\s*$|^\\s*#' "$input_file")"
+
+    exec 3< "$input_file"
+
+    while IFS= read -r line <&3; do
+        [[ -z "$line" || "$line" =~ ^# ]] && continue
+        sim_count=$((sim_count + 1))
+        echo
+        echo "========== Simulation #$sim_count =========="
+        echo "Command: $line"
+
+        start_time=$(date +%s)
+
+        {run_line}
+        exit_code=$?
+
+        end_time=$(date +%s)
+        duration=$((end_time - start_time))
+
+{exit_check}
+{postprocess_block}        echo "==========================================="
+    done
+
+    exec 3<&-
+
+else
+    echo "Error: Input file $input_file not found!"
+    exit 1
+fi
+
+total_end=$(date +%s)
+total_runtime=$((total_end - total_start))
+echo
+echo "==========================================="
+printf "Total runtime for all simulations: %02d:%02d (mm:ss)\\n" $((total_runtime/60)) $((total_runtime%60))
+echo "==========================================="
+"""
+
+
+def write_bash_script(
+    script_path: Path, partition, time_limit, memory,
+    timeout_minutes=None, pdg_log_dir=None,
+    postprocess=False,
+    electrons_dx=10.0,   muons_dx=10.0,   photons_dx=10.0,
+    electrons_nmax=6016, muons_nmax=4096,  photons_nmax=8192,
+):
+    script_path.parent.mkdir(parents=True, exist_ok=True)
+    content = render_bash_template(
+        LOGS_DIR_DEFAULT, partition, time_limit, memory,
+        timeout_minutes=timeout_minutes, pdg_log_dir=pdg_log_dir,
+        postprocess=postprocess,
+        electrons_dx=electrons_dx,     muons_dx=muons_dx,     photons_dx=photons_dx,
+        electrons_nmax=electrons_nmax, muons_nmax=muons_nmax,  photons_nmax=photons_nmax,
+    )
+    with open(script_path, "w") as f:
+        f.write(content)
+    os.chmod(script_path, 0o755)
+
+
+# =============================================================================
+# ── Job submission ────────────────────────────────────────────────────────────
+# =============================================================================
+
+def submit_job(script_path: Path, args_file: Path, extra_sbatch=None, dry_run=False):
+    cmd = ["sbatch"]
+    if extra_sbatch:
+        cmd += extra_sbatch
+    cmd += [f"--export=ALL,INPUT_FILE={args_file}", str(script_path)]
+
+    if dry_run:
+        print("$ " + " ".join(cmd))
+        return None
+
+    proc = subprocess.run(cmd, text=True, capture_output=True)
+    if proc.returncode != 0:
+        msg = []
+        if proc.stdout.strip(): msg.append("STDOUT:\n" + proc.stdout.strip())
+        if proc.stderr.strip(): msg.append("STDERR:\n" + proc.stderr.strip())
+        raise RuntimeError("sbatch failed (exit {}):\n{}".format(proc.returncode, "\n".join(msg)))
+    print(proc.stdout.strip())
+    return proc.stdout.strip()
+
+
+# =============================================================================
+# ── CLI ───────────────────────────────────────────────────────────────────────
+# =============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Submit TAMBO air-shower simulations to SLURM."
+    )
+
+    parser.add_argument("--pdg", type=int, required=True, choices=[211, -211, 111, 11, -11])
+    parser.add_argument("--partition", "-p", default="shared,sapphire")
+    parser.add_argument("--mem",             default="8G")
+    parser.add_argument("--time-limit",      default="1-00:00")
+    parser.add_argument("--jobs",            type=int,   default=1)
+    parser.add_argument("--sims-per-job",    type=int,   default=10)
+    parser.add_argument("--args-dir",        default=ARGS_DIR_DEFAULT)
+    parser.add_argument("--script-out",      default=None)
+    parser.add_argument("--seed",            type=int,   default=None)
+    parser.add_argument("--sbatch-flags",    nargs=argparse.REMAINDER)
+    parser.add_argument("--dry-run",         action="store_true")
+    parser.add_argument("--timeout",         type=int,   default=None, metavar="MINUTES")
+    parser.add_argument("--submit-sleep",    type=float, default=0.5)
+    parser.add_argument("--job-limit",       type=int,   default=10000)
+    parser.add_argument("--gamma",           type=float, default=1.0)
+
+    pp = parser.add_argument_group("Post-processing")
+    pp.add_argument("--postprocess",     action="store_true")
+    pp.add_argument("--electrons-dx",    type=float, default=10.0,  metavar="M")
+    pp.add_argument("--muons-dx",        type=float, default=10.0,  metavar="M")
+    pp.add_argument("--photons-dx",      type=float, default=10.0,  metavar="M")
+    pp.add_argument("--electrons-nmax",  type=int,   default=6016,  metavar="N")
+    pp.add_argument("--muons-nmax",      type=int,   default=4096,  metavar="N")
+    pp.add_argument("--photons-nmax",    type=int,   default=8192,  metavar="N")
+
+    args = parser.parse_args()
+
+    if args.seed is not None:
+        random.seed(args.seed)
+
+    ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
+    script_path = (Path(args.script_out) if args.script_out
+                   else Path(SCRIPT_OUT_BASE) / f"run_tambo_batch_pdg_{args.pdg}_{ts}.sh")
+
+    logs_dir    = Path(LOGS_DIR_DEFAULT)
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    pdg_log_dir = logs_dir / f"pdg_{args.pdg}"
+    if not pdg_log_dir.exists():
+        pdg_log_dir.mkdir(parents=True)
+        print(f"Created log subdirectory -> {pdg_log_dir}")
+    else:
+        print(f"Using existing log subdirectory -> {pdg_log_dir}")
+
+    try:
+        flag_used = get_pdg_flags(args.pdg)
+        print(f"PDG: {args.pdg} selected. Using flag: '{flag_used}'")
+    except ValueError as e:
+        print(f"Error: {e}"); sys.exit(1)
+
+    if args.gamma <= 0:
+        print(f"Error: --gamma must be positive (got {args.gamma})"); sys.exit(1)
+
+    timeout_str = f"{args.timeout}m" if args.timeout else "none"
+    print(f"Config: Partition={args.partition}, Time={args.time_limit}, "
+          f"Mem={args.mem}, Timeout={timeout_str}, Gamma={args.gamma}")
+
+    if args.postprocess:
+        print(
+            f"Post-processing: ENABLED  (via {PREPROCESS_SCRIPT})\n"
+            f"  electrons  dx={args.electrons_dx}m  nmax={args.electrons_nmax}\n"
+            f"  muons      dx={args.muons_dx}m  nmax={args.muons_nmax}\n"
+            f"  photons    dx={args.photons_dx}m  nmax={args.photons_nmax}"
+        )
+
+    write_bash_script(
+        script_path,
+        partition=args.partition, time_limit=args.time_limit, memory=args.mem,
+        timeout_minutes=args.timeout, pdg_log_dir=pdg_log_dir,
+        postprocess=args.postprocess,
+        electrons_dx=args.electrons_dx,     muons_dx=args.muons_dx,     photons_dx=args.photons_dx,
+        electrons_nmax=args.electrons_nmax, muons_nmax=args.muons_nmax, photons_nmax=args.photons_nmax,
+    )
+    print(f"Wrote SBATCH script -> {script_path}")
+
+    total = args.jobs * args.sims_per_job
+    print(f"Preparing {args.jobs} jobs × {args.sims_per_job} sims/job (total {total})")
+
+    if args.jobs > args.job_limit:
+        eta = (args.jobs * args.submit_sleep) / 60
+        print(f"  WARNING: --jobs {args.jobs} exceeds --job-limit {args.job_limit}. "
+              f"Submission ~{eta:.1f} min.")
+    elif args.jobs >= 100:
+        eta = (args.jobs * args.submit_sleep) / 60
+        print(f"  Info: ~{eta:.1f} min to submit {args.jobs} jobs.")
+
+    submitted, failed = [], 0
+    bar = tqdm(range(1, args.jobs + 1), desc="Submitting", unit="job", dynamic_ncols=True)
+    for j in bar:
+        args_file = Path(args.args_dir) / f"args_{args.pdg}_{ts}_job{j}.txt"
+        write_args_file(args_file, args.sims_per_job, args.pdg, args.gamma)
+        try:
+            out = submit_job(script_path, args_file,
+                             extra_sbatch=args.sbatch_flags, dry_run=args.dry_run)
+        except RuntimeError as e:
+            failed += 1
+            tqdm.write(f"  [job {j}] FAILED: {e}")
+            out = None
+        if out:
+            submitted.append({"job": j, "sbatch": out, "args_file": str(args_file)})
+        bar.set_postfix(submitted=len(submitted), failed=failed)
+        if not args.dry_run and j < args.jobs:
+            time.sleep(args.submit_sleep)
+
+    if args.dry_run:
+        print("\n(DRY RUN) Done. No jobs submitted.")
+    else:
+        print(f"\nDone. {len(submitted)} submitted, {failed} failed.")
+        if failed == 0:
+            print("All jobs submitted successfully.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
