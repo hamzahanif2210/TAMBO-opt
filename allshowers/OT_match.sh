@@ -14,4 +14,4 @@ mamba activate /n/holylfs05/LABS/arguelles_delgado_lab/Everyone/hhanif/tamboOpt_
 
 
 
-python /n/home04/hhanif/AllShowers/allshowers/OT_match.py /n/home04/hhanif/AllShowers/conf/allshowers_electrons.yaml --with-time
+python /n/home04/hhanif/TAMBO-opt/allshowers/OT_match.py /n/home04/hhanif/TAMBO-opt/conf/allshowers_electrons.yaml --with-time
