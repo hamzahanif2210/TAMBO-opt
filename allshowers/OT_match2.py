@@ -1,6 +1,7 @@
 import argparse
 import multiprocessing
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -121,6 +122,17 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         help="Number of Slurm array jobs (only used with --heavy-files). Default: 100.",
     )
 
+    # ── Merge sidecars after array jobs finish ──────────────────────────
+    parser.add_argument(
+        "--merge",
+        action="store_true",
+        default=False,
+        help=(
+            "Merge per-worker sidecar HDF5 files into the main data file. "
+            "Runs automatically after array jobs complete."
+        ),
+    )
+
     # ── Internal use: array worker arguments (set automatically by Slurm) ──
     parser.add_argument("--start", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--end",   type=int, default=None, help=argparse.SUPPRESS)
@@ -149,7 +161,8 @@ def submit_array_slurm_jobs(
     num_jobs: int,
     with_time: bool,
 ) -> None:
-    """Submit a Slurm array that splits showers across num_jobs workers."""
+    """Submit a Slurm array that splits showers across num_jobs workers,
+    followed by a merge job that combines sidecars into the main file."""
     showers_per_job = -(-num_showers // num_jobs)  # ceiling division
     script_path = os.path.abspath(__file__)
 
@@ -172,28 +185,53 @@ def submit_array_slurm_jobs(
         f"{showers_per_job} showers/job, "
         f"total {num_showers} showers"
     )
-    _submit_script(script_body, label="array")
+    array_job_id = _submit_script(script_body, label="array")
+
+    # Submit a merge job that runs after all array tasks complete
+    merge_cmd = (
+        f"python {script_path} {config_file} {time_flag} "
+        f"--merge --num-jobs {num_jobs}\n"
+    )
+    merge_header = SLURM_SINGLE_HEADER  # reuse single-job header (only needs modest resources)
+    merge_body = merge_header + "\n" + merge_cmd
+    if array_job_id:
+        _submit_script(merge_body, label="merge", dependency=f"afterok:{array_job_id}")
+    else:
+        print_time("WARNING: could not parse array job ID — submit merge job manually:")
+        print_time(f"  python {script_path} {config_file} {time_flag} --merge --num-jobs {num_jobs}")
 
 
-def _submit_script(script_body: str, label: str) -> None:
+def _submit_script(
+    script_body: str, label: str, dependency: str | None = None,
+) -> str | None:
+    """Submit a Slurm script and return the job ID (or None on failure to parse)."""
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".sh", delete=False, prefix=f"ot_{label}_"
     ) as f:
         f.write(script_body)
         tmp_path = f.name
 
+    cmd = ["sbatch"]
+    if dependency:
+        cmd += [f"--dependency={dependency}"]
+    cmd.append(tmp_path)
+
     print_time(f"Submitting Slurm script: {tmp_path}")
     print("─" * 60)
     print(script_body)
     print("─" * 60)
 
-    result = subprocess.run(["sbatch", tmp_path], capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode == 0:
         print_time("Submitted:", result.stdout.strip())
     else:
         print_time("sbatch failed:", result.stderr.strip())
         sys.exit(1)
     os.unlink(tmp_path)
+
+    # Parse job ID from "Submitted batch job 12345"
+    match = re.search(r"(\d+)", result.stdout)
+    return match.group(1) if match else None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -455,6 +493,12 @@ def process_full_file(
     sys.stdout.flush()
 
 
+def _sidecar_path(data_file: str, slice_start: int, slice_end: int) -> str:
+    """Return the path for a per-worker sidecar HDF5 file."""
+    base, ext = os.path.splitext(data_file)
+    return f"{base}_target_{slice_start}_{slice_end}{ext}"
+
+
 def process_slice(
     data_file: str,
     data_shape: tuple[int, ...],
@@ -467,8 +511,9 @@ def process_slice(
     """
     Heavy-files worker path.
 
-    Processes showers [slice_start, slice_end) and writes noise back to the
-    HDF5 file using exact-point storage (no padding zeros saved).
+    Processes showers [slice_start, slice_end) and writes noise to a
+    per-worker sidecar HDF5 file to avoid concurrent-write corruption.
+    The sidecar is later merged by the --merge step.
     """
     F = pre_processor.num_features
     slice_len = slice_end - slice_start
@@ -501,30 +546,72 @@ def process_slice(
             print_time(f"  batch {i+1}/{num_batches} done")
             sys.stdout.flush()
 
-    print_time("All batches processed. Computing num_points and writing to HDF5...")
+    print_time("All batches processed. Computing num_points and writing to sidecar...")
     sys.stdout.flush()
 
-    # num_points per shower = number of non-zero energy rows
-    # noise padding positions were zeroed by NoiseMatcher, so energy col (index 2) is 0 there
-    # Use the original mask: any non-zero feature in any column means a real hit
-    # Safest: read num_points from the source file directly
+    # Read num_points from the source file
     with showerdata.ShowerDataFile(data_file, "r") as sf:
         src_showers = sf[slice_start:slice_end]
         num_points = src_showers._num_points.astype(np.int32)  # shape [slice_len]
 
+    # Write to a per-worker sidecar file (avoids concurrent writes to main file)
+    sidecar = _sidecar_path(data_file, slice_start, slice_end)
+    init_target_dataset(sidecar, slice_len, F, key=key)
     save_target_batch_exact(
         noise=noise_full,        # [slice_len, max_points, F]
         num_points=num_points,   # [slice_len]
-        path=data_file,
-        start=slice_start,
+        path=sidecar,
+        start=0,                 # write at the beginning of the sidecar
         key=key,
     )
 
     print_time(
-        f"Slice [{slice_start}, {slice_end}) written to '{key}' "
+        f"Slice [{slice_start}, {slice_end}) written to sidecar '{sidecar}' "
         f"(exact points, no padding)."
     )
     sys.stdout.flush()
+
+
+def merge_sidecars(
+    data_file: str,
+    num_showers: int,
+    num_jobs: int,
+    F: int,
+    key: str = "target",
+) -> None:
+    """
+    Merge per-worker sidecar HDF5 files into the main data file sequentially.
+    This avoids the HDF5 vlen heap corruption caused by concurrent writes.
+    """
+    showers_per_job = -(-num_showers // num_jobs)
+
+    # Ensure target group exists in main file
+    init_target_dataset(data_file, num_showers, F, key=key)
+
+    with h5py.File(data_file, "a") as main_f:
+        pc_ds  = main_f[f"{key}/point_clouds"]
+        npt_ds = main_f[f"{key}/num_points"]
+
+        for job_id in range(num_jobs):
+            s = job_id * showers_per_job
+            e = min(s + showers_per_job, num_showers)
+            if s >= num_showers:
+                break
+
+            sidecar = _sidecar_path(data_file, s, e)
+            if not os.path.exists(sidecar):
+                print_time(f"WARNING: sidecar {sidecar} not found — skipping")
+                continue
+
+            slice_len = e - s
+            with h5py.File(sidecar, "r") as sf:
+                pc_ds[s:e]  = sf[f"{key}/point_clouds"][:slice_len]
+                npt_ds[s:e] = sf[f"{key}/num_points"][:slice_len]
+
+            os.remove(sidecar)
+            print_time(f"Merged sidecar [{s}, {e}) and deleted {sidecar}")
+
+    print_time(f"All sidecars merged into '{data_file}' under '{key}'.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -547,26 +634,44 @@ def main(args: list[str] | None = None):
         submit_single_slurm_job(parsed_args.file, extra)
         return
 
-    # ── 2. --heavy-files: submit array jobs and exit ───────────────────────
+    # ── 2. --heavy-files: submit array jobs + merge job, then exit ──────
     if parsed_args.heavy_files:
-        # Need to know total showers — read config to get file path
+        with open(parsed_args.file) as f:
+            config = yaml.safe_load(f)
+        data_shape = showerdata.get_file_shape(config["data"]["path"])
+        num_showers = data_shape[0]
+
+        # NOTE: do NOT pass --heavy-files to workers — that caused recursive submission
+        # Workers write to per-worker sidecar files; merge job combines them.
+        submit_array_slurm_jobs(
+            config_file=parsed_args.file,
+            num_showers=num_showers,
+            num_jobs=parsed_args.num_jobs,
+            with_time=parsed_args.with_time,
+        )
+        return
+
+    # ── 2b. --merge: combine sidecar files after array jobs ──────────────
+    if parsed_args.merge:
         with open(parsed_args.file) as f:
             config = yaml.safe_load(f)
         data_shape = showerdata.get_file_shape(config["data"]["path"])
         num_showers = data_shape[0]
         F = 4 if parsed_args.with_time else 3
 
-        # Ensure target group exists before workers start writing
-        print_time(f"Initialising target dataset in {config['data']['path']} ...")
-        init_target_dataset(config["data"]["path"], num_showers, F, key="target")
+        # Delete existing target group so we start fresh
+        data_path = config["data"]["path"]
+        with h5py.File(data_path, "a") as hf:
+            if "target" in hf:
+                del hf["target"]
+                print_time("Deleted old 'target' group from main file.")
 
-        # NOTE: do NOT pass --heavy-files to workers — that caused recursive submission
-        # Workers only receive --with-time (if set) plus --start and --end
-        submit_array_slurm_jobs(
-            config_file=parsed_args.file,
+        merge_sidecars(
+            data_file=data_path,
             num_showers=num_showers,
             num_jobs=parsed_args.num_jobs,
-            with_time=parsed_args.with_time,
+            F=F,
+            key="target",
         )
         return
 
