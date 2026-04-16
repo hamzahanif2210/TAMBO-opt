@@ -114,6 +114,24 @@ class Trainer:
         config = config.copy()
         if "name" not in config:
             raise ValueError("Model configuration missing.")
+        if "dim_input" in config and config["dim_input"] != self.dim_data:
+            warnings.warn(
+                (
+                    f'Overriding model dim_input from {config["dim_input"]} '
+                    f"to loader dim_data={self.dim_data}."
+                ),
+                UserWarning,
+            )
+        if "dim_condition" in config and config["dim_condition"] != self.dim_condition:
+            warnings.warn(
+                (
+                    f'Overriding model dim_condition from {config["dim_condition"]} '
+                    f"to loader dim_condition={self.dim_condition}."
+                ),
+                UserWarning,
+            )
+        config["dim_input"] = self.dim_data
+        config["dim_condition"] = self.dim_condition
         flow_config = config.pop("flow") if "flow" in config else {}
         model_name = config.pop("name")
         model_class = getattr(models, model_name)
