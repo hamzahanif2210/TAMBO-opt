@@ -18,7 +18,7 @@ Launch strategy (no torchrun / no c10d TCPStore):
 
 Example:
 
-python /n/home04/hhanif/AllShowers/mkresultdir_pointcloudfm.py /n/home04/hhanif/AllShowers/conf/pointCloudFM_electron.yaml \
+python /n/home04/hhanif/TAMBO-opt/mkresultdir_pointcloudfm.py /n/home04/hhanif/TAMBO-opt/conf/pointCloudFM_electron.yaml \
   -p gpu_requeue -g 1 -n 1 --mem 10G --cpus-per-task 1 --time 2:00:00 -r
 
 """
