@@ -11,6 +11,8 @@ data:
   samples_time_trafo:
     - [Log, {alpha: 0.0}]
     - [StandardScaler, {shape: [1, 1]}]
+  samples_z_trafo:
+    - [StandardScaler, {shape: [1, 1]}]
   cond_trafo:
     - [Log, {alpha: 0.0}]
     - [StandardScaler, {shape: [1, 1]}]
@@ -22,7 +24,7 @@ data:
 
 model:
   num_layers: 24
-  dim_inputs: [4, 6, 4]    # 3 → 4: x, y, e, t
+  dim_inputs: [5, 6, 4]    # x, y, z_depth, e, t
   dim_embedding: 64
   num_head: 4
   num_blocks: 4

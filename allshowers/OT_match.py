@@ -43,21 +43,35 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         default=False,
         help=(
-            "Include time as a 4th point feature (x, y, e, t) when computing OT. "
+            "Include time as a point feature when computing OT. "
             "Requires 'samples_time_trafo' in the config and a 5-column data file. "
-            "Without this flag, the original 3-feature mode (x, y, e) is used."
+            "Without this flag, time is not included."
+        ),
+    )
+    parser.add_argument(
+        "--with-z",
+        action="store_true",
+        default=False,
+        help=(
+            "Include continuous z-depth as a point feature when computing OT. "
+            "Requires 'samples_z_trafo' in the config. "
+            "Plane index is converted to z_depth = (index + 1) * 500 m."
         ),
     )
     return parser.parse_args(args)
 
 
 class PreProcessor:
-    def __init__(self, config_file: str, with_time: bool = False) -> None:
+    Z_DEPTH_STEP = 500.0
+
+    def __init__(self, config_file: str, with_time: bool = False, with_z: bool = False) -> None:
         with open(config_file) as file:
             config = yaml.safe_load(file)
 
         self.with_time = with_time
-        self.num_features = 4 if with_time else 3
+        self.with_z = with_z
+        # Feature count: x(1) + y(1) + [z_depth(1)] + e(1) + [t(1)]
+        self.num_features = 2 + int(with_z) + 1 + int(with_time)
 
         self.samples_energy_trafo = preprocessing.compose(
             transformation=config["data"]["samples_energy_trafo"],
@@ -78,10 +92,22 @@ class PreProcessor:
         else:
             self.samples_time_trafo = None
 
+        if self.with_z:
+            if "samples_z_trafo" not in config["data"]:
+                raise KeyError(
+                    "'--with-z' was set but 'samples_z_trafo' is missing from "
+                    "the config file's 'data' section."
+                )
+            self.samples_z_trafo = preprocessing.compose(
+                transformation=config["data"]["samples_z_trafo"],
+            )
+        else:
+            self.samples_z_trafo = None
+
         self.file_path, showers, self.data_shape = self.__get_data(config)
         showers = torch.from_numpy(showers)
 
-        # Mask is based on energy (col 3) in both modes
+        # Mask is based on energy (col 3) in all modes
         mask = showers[:, :, 3] > 0.0
 
         self.samples_coordinate_trafo.to(showers.dtype)
@@ -100,6 +126,14 @@ class PreProcessor:
             self.samples_time_trafo.to(showers.dtype)
             self.samples_time_trafo.fit(
                 x=showers[:, :, 4],
+                mask=mask,
+            )
+
+        if self.with_z:
+            self.samples_z_trafo.to(showers.dtype)
+            z_depth = (showers[:, :, 2] + 1.0) * self.Z_DEPTH_STEP
+            self.samples_z_trafo.fit(
+                x=z_depth,
                 mask=mask,
             )
 
@@ -125,7 +159,7 @@ class PreProcessor:
         # x shape: [batch, 4 or 5, points]  — transposed by DataLoader
         x_tensor = torch.from_numpy(x)
 
-        # Mask on energy (row 3 in transposed layout) — same in both modes
+        # Mask on energy (row 3 in transposed layout) — same in all modes
         mask = x_tensor[:, 3] > 0.0
 
         # Transform x, y (cols 0, 1)
@@ -136,17 +170,28 @@ class PreProcessor:
         # Transform e (col 3)
         x_tensor[:, 3] = self.samples_energy_trafo(x_tensor[:, 3])
 
-        # Extract layer from z (col 2) before dropping it
+        # Extract layer from z (col 2) before any transforms
         layer = (x_tensor[:, 2] + 0.5).to(torch.int64)
+
+        # Build feature selection list: x, y, [z_depth], e, [t]
+        if self.with_z:
+            # Convert plane index → z_depth and transform
+            z_depth = (x_tensor[:, 2] + 1.0) * self.Z_DEPTH_STEP
+            x_tensor[:, 2] = self.samples_z_trafo(z_depth)
 
         if self.with_time:
             # Transform t (col 4)
             x_tensor[:, 4] = self.samples_time_trafo(x_tensor[:, 4])
-            # Drop z: keep x, y, e, t → [batch, 4, points]
-            x_tensor = x_tensor[:, [0, 1, 3, 4]]
+
+        # Select features in order: x, y, [z_depth], e, [t]
+        if self.with_z and self.with_time:
+            x_tensor = x_tensor[:, [0, 1, 2, 3, 4]]  # x, y, z, e, t
+        elif self.with_z:
+            x_tensor = x_tensor[:, [0, 1, 2, 3]]      # x, y, z, e
+        elif self.with_time:
+            x_tensor = x_tensor[:, [0, 1, 3, 4]]      # x, y, e, t (drop z)
         else:
-            # Original: drop z, keep x, y, e → [batch, 3, points]
-            x_tensor = x_tensor[:, [0, 1, 3]]
+            x_tensor = x_tensor[:, [0, 1, 3]]          # x, y, e (drop z)
 
         return x_tensor.numpy(), mask.numpy(), layer.numpy()
 
@@ -224,7 +269,7 @@ def process_file(
     num_batches = -(-data_shape[0] // batch_size)
     print_time("batch size:", batch_size)
     print_time("number of batches:", num_batches)
-    print_time(f"num features: {F}  {'(x, y, e, t)' if F == 4 else '(x, y, e)'}")
+    print_time(f"num features: {F}")
     sys.stdout.flush()
 
     noise_matcher = NoiseMatcher(pre_processor)
@@ -259,12 +304,16 @@ def main(args: list[str] | None = None):
 
     parsed_args = parse_args(args)
     print_time("Parsing arguments:", parsed_args)
-    print_time(
-        f"Mode: {'with time (x, y, e, t)' if parsed_args.with_time else 'original (x, y, e)'}"
-    )
+    feat_list = ["x", "y"]
+    if parsed_args.with_z:
+        feat_list.append("z_depth")
+    feat_list.append("e")
+    if parsed_args.with_time:
+        feat_list.append("t")
+    print_time(f"Mode: ({', '.join(feat_list)})")
     sys.stdout.flush()
 
-    pre_processor = PreProcessor(parsed_args.file, with_time=parsed_args.with_time)
+    pre_processor = PreProcessor(parsed_args.file, with_time=parsed_args.with_time, with_z=parsed_args.with_z)
     print_time("PreProcessor initialized.")
     sys.stdout.flush()
 

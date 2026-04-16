@@ -76,9 +76,11 @@ class Generator(nn.Module):
         self.max_points = run_params["data"].get("max_num_points", 6016)
         self.expects_angles = run_params["model"]["dim_inputs"][-1] > 1
 
-        # Auto-detect time mode from config — no CLI flag needed.
-        # If the model was trained with samples_time_trafo, dim_inputs[0] == 4.
-        self.with_time = run_params["model"]["dim_inputs"][0] == 4
+        # Detect continuous z mode: samples_z_trafo present in data config
+        self.with_z = "samples_z_trafo" in run_params["data"] and run_params["data"]["samples_z_trafo"] is not None
+
+        # Detect time mode: samples_time_trafo present in data config
+        self.with_time = "samples_time_trafo" in run_params["data"] and run_params["data"]["samples_time_trafo"] is not None
 
     def __init_model(
         self, params: dict[str, Any], state_file: str, solver: str = "heun"
@@ -108,20 +110,25 @@ class Generator(nn.Module):
         self.samples_coordinate_trafo = compose(params.get("samples_coordinate_trafo"))
         self.cond_trafo = compose(params.get("cond_trafo"))
 
-        # Time trafo — only present when model was trained with time
         if params.get("samples_time_trafo") is not None:
             self.samples_time_trafo = compose(params.get("samples_time_trafo"))
         else:
             self.samples_time_trafo = None
+
+        if params.get("samples_z_trafo") is not None:
+            self.samples_z_trafo = compose(params.get("samples_z_trafo"))
+        else:
+            self.samples_z_trafo = None
 
         state = torch.load(trafo_file, map_location="cpu", weights_only=True)
         self.samples_energy_trafo.load_state_dict(state["samples_energy_trafo"])
         self.samples_coordinate_trafo.load_state_dict(state["samples_coordinate_trafo"])
         self.cond_trafo.load_state_dict(state["cond_trafo"])
 
-        # Load time trafo state if saved in the trafos file
         if self.samples_time_trafo is not None and "samples_time_trafo" in state:
             self.samples_time_trafo.load_state_dict(state["samples_time_trafo"])
+        if self.samples_z_trafo is not None and "samples_z_trafo" in state:
+            self.samples_z_trafo.load_state_dict(state["samples_z_trafo"])
 
     def forward(
         self,
@@ -153,8 +160,47 @@ class Generator(nn.Module):
         layer = layer.to(condition.device)
         mask = mask.to(condition.device)
 
-        if self.with_time:
-            # Sample 4 features: x, y, e, t
+        if self.with_z and self.with_time:
+            # 5 features: x, y, z_depth, e, t
+            raw_samples = self.flow.sample(
+                shape=(condition.shape[0], self.max_points, 5),
+                num_timesteps=self.num_timesteps,
+                cond=condition,
+                num_points=num_points,
+                layer=layer,
+                mask=mask,
+                label=label,
+            )
+            # Reconstruct 5-column output: x, y, z_depth, e, t
+            samples = torch.zeros(
+                (condition.shape[0], self.max_points, 5), device=raw_samples.device
+            )
+            samples[:, :, :2] = self.samples_coordinate_trafo.inverse(raw_samples[:, :, :2])
+            samples[:, :, 2]  = self.samples_z_trafo.inverse(raw_samples[:, :, 2])
+            samples[:, :, 3]  = self.samples_energy_trafo.inverse(raw_samples[:, :, 3])
+            samples[:, :, 4]  = self.samples_time_trafo.inverse(raw_samples[:, :, 4])
+            samples[~mask.repeat(1, 1, 5)] = 0
+        elif self.with_z:
+            # 4 features: x, y, z_depth, e
+            raw_samples = self.flow.sample(
+                shape=(condition.shape[0], self.max_points, 4),
+                num_timesteps=self.num_timesteps,
+                cond=condition,
+                num_points=num_points,
+                layer=layer,
+                mask=mask,
+                label=label,
+            )
+            # Reconstruct 4-column output: x, y, z_depth, e
+            samples = torch.zeros(
+                (condition.shape[0], self.max_points, 4), device=raw_samples.device
+            )
+            samples[:, :, :2] = self.samples_coordinate_trafo.inverse(raw_samples[:, :, :2])
+            samples[:, :, 2]  = self.samples_z_trafo.inverse(raw_samples[:, :, 2])
+            samples[:, :, 3]  = self.samples_energy_trafo.inverse(raw_samples[:, :, 3])
+            samples[~mask.repeat(1, 1, 4)] = 0
+        elif self.with_time:
+            # 4 features: x, y, e, t  (legacy: no continuous z)
             raw_samples = self.flow.sample(
                 shape=(condition.shape[0], self.max_points, 4),
                 num_timesteps=self.num_timesteps,
@@ -174,7 +220,7 @@ class Generator(nn.Module):
             samples[:, :, 4]  = self.samples_time_trafo.inverse(raw_samples[:, :, 3])
             samples[~mask.repeat(1, 1, 5)] = 0
         else:
-            # Original: sample 3 features: x, y, e
+            # 3 features: x, y, e  (legacy: no continuous z)
             raw_samples = self.flow.sample(
                 shape=(condition.shape[0], self.max_points, 3),
                 num_timesteps=self.num_timesteps,
@@ -335,7 +381,13 @@ def main(args: list[str] | None = None) -> None:
         resize_factor=parsed_args.rescale_factor,
     )
 
-    print_time(f"time mode: {'ON (x,y,e,t)' if generator.with_time else 'OFF (x,y,e)'}")
+    feat_list = ["x", "y"]
+    if generator.with_z:
+        feat_list.append("z_depth")
+    feat_list.append("e")
+    if generator.with_time:
+        feat_list.append("t")
+    print_time(f"features: {', '.join(feat_list)}")
 
     cond_data = showerdata.observables.read_observables_from_file(
         parsed_args.cond_file,

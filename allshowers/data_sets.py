@@ -12,6 +12,9 @@ from allshowers.preprocessing import Identity, Transformation, compose
 
 __all__ = ["create_label_list", "to_label_tensor", "get_data_loaders"]
 
+# Physical z-depth mapping: plane index 0 → 500 m, plane index 23 → 12000 m
+Z_DEPTH_STEP = 500.0  # metres between consecutive planes
+
 
 class ShowerDict(TypedDict):
     shower: Tensor
@@ -41,7 +44,8 @@ def initialise_trafos(
     samples_energy_trafo: Transformation,
     samples_coordinate_trafo: Transformation,
     cond_trafo: Transformation,
-    samples_time_trafo: Transformation | None = None,   # ADD: optional time trafo
+    samples_time_trafo: Transformation | None = None,
+    samples_z_trafo: Transformation | None = None,
     *,
     trafos_file: str = "",
     rank: int = 0,
@@ -63,9 +67,10 @@ def initialise_trafos(
         samples_energy_trafo.load_state_dict(parameters["samples_energy_trafo"])
         samples_coordinate_trafo.load_state_dict(parameters["samples_coordinate_trafo"])
         cond_trafo.load_state_dict(parameters["cond_trafo"])
-        # Load time trafo state if present in the saved file
         if samples_time_trafo is not None and "samples_time_trafo" in parameters:
             samples_time_trafo.load_state_dict(parameters["samples_time_trafo"])
+        if samples_z_trafo is not None and "samples_z_trafo" in parameters:
+            samples_z_trafo.load_state_dict(parameters["samples_z_trafo"])
         print(f"[rank {rank}] Loaded transformations from {trafos_file}")
     else:
         if rank != 0:
@@ -78,18 +83,22 @@ def initialise_trafos(
         cond_trafo.fit(energies_l)
         samples_coordinate_trafo.fit(showers_l[:, :, :2], mask_l)
         samples_energy_trafo.fit(showers_l[:, :, 3], mask_l.squeeze())
-        # Fit time trafo on col 4 if provided
         if samples_time_trafo is not None:
             samples_time_trafo.fit(showers_l[:, :, 4], mask_l.squeeze())
+        if samples_z_trafo is not None:
+            # Fit on z_depth converted from plane index: z_depth = (plane_idx + 1) * 500
+            z_depth_l = (showers_l[:, :, 2] + 1.0) * Z_DEPTH_STEP
+            samples_z_trafo.fit(z_depth_l, mask_l.squeeze())
         if trafos_file:
             parameters = {
                 "samples_energy_trafo": samples_energy_trafo.state_dict(),
                 "samples_coordinate_trafo": samples_coordinate_trafo.state_dict(),
                 "cond_trafo": cond_trafo.state_dict(),
             }
-            # Save time trafo state alongside the others
             if samples_time_trafo is not None:
                 parameters["samples_time_trafo"] = samples_time_trafo.state_dict()
+            if samples_z_trafo is not None:
+                parameters["samples_z_trafo"] = samples_z_trafo.state_dict()
             torch.save(parameters, trafos_file)
             print(f"[rank {rank}] Saved transformations to {trafos_file}")
         if world_size > 1:
@@ -187,7 +196,8 @@ def load_and_prepare(
     samples_energy_trafo: Transformation = Identity(),
     samples_coordinate_trafo: Transformation = Identity(),
     cond_trafo: Transformation = Identity(),
-    samples_time_trafo: Transformation | None = None,   # ADD: None = original mode
+    samples_time_trafo: Transformation | None = None,
+    samples_z_trafo: Transformation | None = None,
     start: int = 0,
     stop: int | None = None,
     return_noise: bool = False,
@@ -201,6 +211,7 @@ def load_and_prepare(
     local_rank: int = 0,
 ) -> ModelInputDict:
     with_time = samples_time_trafo is not None
+    with_z = samples_z_trafo is not None
 
     data = load_data(
         path,
@@ -222,7 +233,8 @@ def load_and_prepare(
             samples_energy_trafo,
             samples_coordinate_trafo,
             cond_trafo,
-            samples_time_trafo,            # passed through; None in original mode
+            samples_time_trafo,
+            samples_z_trafo,
             trafos_file=trafos_file,
             rank=rank,
             world_size=world_size,
@@ -231,19 +243,45 @@ def load_and_prepare(
 
     energy = cond_trafo(data["energy"])
 
-    if with_time:
-        # 4 features: x, y, e, t   (z/layer stored separately)
+    # Convert plane index → physical z-depth (metres)
+    z_depth = (data["shower"][:, :, [2]] + 1.0) * Z_DEPTH_STEP  # plane 0→500, …, 23→12000
+
+    if with_time and with_z:
+        # 5 features: x, y, z_depth, e, t
         x = torch.concat(
             [
                 samples_coordinate_trafo(data["shower"][:, :, :2]),     # x, y
-                samples_energy_trafo(data["shower"][:, :, [3]]),         # e
-                samples_time_trafo(data["shower"][:, :, [4]]),           # t
+                samples_z_trafo(z_depth),                               # z_depth
+                samples_energy_trafo(data["shower"][:, :, [3]]),        # e
+                samples_time_trafo(data["shower"][:, :, [4]]),          # t
+            ],
+            dim=-1,
+        )
+        x[~mask.repeat(1, 1, 5)] = 0.0
+    elif with_z:
+        # 4 features: x, y, z_depth, e
+        x = torch.concat(
+            [
+                samples_coordinate_trafo(data["shower"][:, :, :2]),     # x, y
+                samples_z_trafo(z_depth),                               # z_depth
+                samples_energy_trafo(data["shower"][:, :, [3]]),        # e
+            ],
+            dim=-1,
+        )
+        x[~mask.repeat(1, 1, 4)] = 0.0
+    elif with_time:
+        # 4 features: x, y, e, t   (legacy: no continuous z)
+        x = torch.concat(
+            [
+                samples_coordinate_trafo(data["shower"][:, :, :2]),     # x, y
+                samples_energy_trafo(data["shower"][:, :, [3]]),        # e
+                samples_time_trafo(data["shower"][:, :, [4]]),          # t
             ],
             dim=-1,
         )
         x[~mask.repeat(1, 1, 4)] = 0.0
     else:
-        # Original: 3 features: x, y, e
+        # 3 features: x, y, e   (legacy: no continuous z)
         x = torch.concat(
             [
                 samples_coordinate_trafo(data["shower"][:, :, :2]),
@@ -318,6 +356,11 @@ def get_data_loaders(
         config_dataset["samples_time_trafo"] = compose(
             config_dataset["samples_time_trafo"]
         )
+    # Wire up z-depth trafo from config if present; enables continuous z prediction
+    if "samples_z_trafo" in config_dataset:
+        config_dataset["samples_z_trafo"] = compose(
+            config_dataset["samples_z_trafo"]
+        )
 
     start = rank * (split // world_size)
     stop = (rank + 1) * (split // world_size)
@@ -375,9 +418,11 @@ def get_data_loaders(
             "samples_coordinate_trafo", Identity()
         ),
         "cond_trafo": config_dataset.get("cond_trafo", Identity()),
-        # Included only when present; generator.py can check with .get()
         **({
             "samples_time_trafo": config_dataset["samples_time_trafo"]
         } if "samples_time_trafo" in config_dataset else {}),
+        **({
+            "samples_z_trafo": config_dataset["samples_z_trafo"]
+        } if "samples_z_trafo" in config_dataset else {}),
     }
     return loader_train, loader_test, trafos
