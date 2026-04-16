@@ -1,3 +1,4 @@
+import copy
 import os
 import time
 import warnings
@@ -7,7 +8,14 @@ import showerdata
 import torch
 from torch import Tensor
 
-from allshowers.data_loader import DataLoader, DictDataSet, ModelInputDict
+from allshowers.data_loader import (
+    DataLoader,
+    DictDataSet,
+    LazyH5DataSet,
+    ModelInputDict,
+    ShardedDataLoader,
+    ShardedDataSet,
+)
 from allshowers.preprocessing import Identity, Transformation, compose
 
 __all__ = ["create_label_list", "to_label_tensor", "get_data_loaders"]
@@ -277,6 +285,171 @@ def load_and_prepare(
     )
 
 
+def _init_trafos_from_sample(
+    path: str,
+    samples_energy_trafo: Transformation,
+    samples_coordinate_trafo: Transformation,
+    cond_trafo: Transformation,
+    samples_time_trafo: Transformation | None,
+    max_num_points: int | None,
+    trafos_file: str,
+    rank: int,
+    world_size: int,
+    local_rank: int,
+    fit_samples: int = 100_000,
+) -> None:
+    """Fit / load preprocessing transformations using a small sample.
+
+    For lazy loading we cannot materialise the whole dataset, so we read
+    just ``fit_samples`` rows from the beginning of the file.
+    """
+    with_time = samples_time_trafo is not None
+    data = load_data(
+        path,
+        start=0,
+        stop=fit_samples,
+        return_noise=False,
+        max_num_points=max_num_points,
+        with_time=with_time,
+    )
+    mask = data["shower"][:, :, [3]] > 0
+    initialise_trafos(
+        data["energy"],
+        data["shower"],
+        mask,
+        samples_energy_trafo,
+        samples_coordinate_trafo,
+        cond_trafo,
+        samples_time_trafo,
+        trafos_file=trafos_file,
+        rank=rank,
+        world_size=world_size,
+        local_rank=local_rank,
+    )
+
+
+def _build_label_map(path: str, data_len: int) -> dict[int, int]:
+    """Read pdg values and return a {pdg_value: label_index} mapping."""
+    import h5py as _h5py
+
+    with _h5py.File(path, "r") as f:
+        pdg = f["pdg"][:data_len]
+    unique_pdg = sorted(set(pdg.flat), key=lambda x: (abs(x), -x))
+    return {int(v): i for i, v in enumerate(unique_pdg)}
+
+
+def _get_sharded_loaders(
+    preprocessed_dir: str,
+    batch_size: int,
+    trafos_file: str,
+) -> tuple[DataLoader, DataLoader, dict[str, Transformation]]:
+    """Build data loaders from pre-transformed .pt shard files.
+
+    Expected directory layout (created by ``preprocess_shards.py``)::
+
+        preprocessed_dir/
+            train_000.pt, train_001.pt, ...
+            val_000.pt, ...
+            trafos.pt
+            meta.pt
+    """
+    shard_trafos_file = os.path.join(preprocessed_dir, "trafos.pt")
+
+    # Load trafos — these are the fitted transformations used during
+    # preprocessing.  We return them so train.py / generator.py can use
+    # them for inverse transforms during generation.
+    trafos_state = torch.load(shard_trafos_file, weights_only=True)
+
+    trafos: dict[str, Transformation] = {}
+    for key, state in trafos_state.items():
+        # Reconstruct trafo module from its state_dict
+        # We need to know which compose() produced it; since the state
+        # dict is self-describing, we load into a fresh Sequence.
+        trafo = _reconstruct_trafo(state)
+        trafos[key] = trafo
+
+    # Also copy trafos to the result_path location so checkpointing is
+    # consistent with the non-sharded paths.
+    if trafos_file and not os.path.isfile(trafos_file):
+        import shutil
+        os.makedirs(os.path.dirname(trafos_file), exist_ok=True)
+        shutil.copy2(shard_trafos_file, trafos_file)
+
+    train_ds = ShardedDataSet(preprocessed_dir, "train")
+    val_ds = ShardedDataSet(preprocessed_dir, "val")
+
+    loader_train = ShardedDataLoader(
+        data_set=train_ds,
+        batch_size=batch_size,
+        drop_last=len(train_ds) > batch_size,
+        shuffle=True,
+    )
+    loader_test = ShardedDataLoader(
+        data_set=val_ds,
+        batch_size=batch_size,
+        drop_last=False,
+        shuffle=False,
+    )
+
+    return loader_train, loader_test, trafos  # type: ignore[return-value]
+
+
+def _reconstruct_trafo(state_dict: dict) -> Transformation:
+    """Rebuild a Transformation (Sequence) from its saved state_dict.
+
+    The state_dict keys follow the pattern ``sub_modules.{i}.{param}``
+    which tells us how many sub-modules there are and what buffers they
+    hold (mean/std → StandardScaler, otherwise → Log/Identity/etc).
+    """
+    from allshowers.preprocessing import (
+        Affine,
+        Log,
+        LogIt,
+        Sequence,
+        StandardScaler,
+    )
+
+    # Parse sub-module indices
+    indices: set[int] = set()
+    for key in state_dict:
+        parts = key.split(".")
+        if len(parts) >= 2 and parts[0] == "sub_modules":
+            indices.add(int(parts[1]))
+
+    if not indices:
+        # No sub-modules: it's a single transformation
+        if "mean" in state_dict and "std" in state_dict:
+            t = StandardScaler(shape=tuple(state_dict["mean"].shape))
+            t.load_state_dict(state_dict)
+            return t
+        return Identity()
+
+    # Keep original sub-module positions. Some stateless transforms
+    # (e.g. Log) do not contribute state_dict entries, which can create
+    # index gaps such as only ``sub_modules.1.*`` being present.
+    modules: list[Transformation] = []
+    for i in range(max(indices) + 1):
+        prefix = f"sub_modules.{i}."
+        sub_state = {
+            k[len(prefix):]: v
+            for k, v in state_dict.items()
+            if k.startswith(prefix)
+        }
+        if "mean" in sub_state and "std" in sub_state:
+            t = StandardScaler(shape=tuple(sub_state["mean"].shape))
+        elif not sub_state:
+            # Stateless module (commonly Log in this project).
+            # Use Log placeholder to preserve module index alignment.
+            t = Log(alpha=0.0)
+        else:
+            t = Identity()
+        modules.append(t)
+
+    seq = Sequence(modules)
+    seq.load_state_dict(state_dict)
+    return seq
+
+
 def get_data_loaders(
     config_dataset: dict,
     batch_size: int,
@@ -286,6 +459,15 @@ def get_data_loaders(
     trafos_file: str = "",
 ) -> tuple[DataLoader, DataLoader, dict[str, Transformation]]:
     config_dataset = config_dataset.copy()
+
+    # ------------------------------------------------------------------
+    # Preprocessed-shards path: data already transformed & saved as .pt
+    # ------------------------------------------------------------------
+    preprocessed_dir = config_dataset.pop("preprocessed_dir", None)
+    if preprocessed_dir is not None:
+        return _get_sharded_loaders(preprocessed_dir, batch_size, trafos_file)
+
+    lazy = config_dataset.pop("lazy", False)
     data_len = showerdata.get_file_shape(config_dataset["path"])[0]
     if "stop" in config_dataset:
         data_len = min(data_len, config_dataset["stop"])
@@ -319,6 +501,99 @@ def get_data_loaders(
             config_dataset["samples_time_trafo"]
         )
 
+    if lazy:
+        # --- Lazy-loading path: read from H5 on the fly ---
+        path = config_dataset["path"]
+        return_noise = config_dataset.get("return_noise", False)
+        return_direction = config_dataset.get("return_direction", False)
+        max_num_points = config_dataset.get("max_num_points", None)
+        num_layers = config_dataset.get("num_layers", -1)
+
+        se_trafo = config_dataset.get("samples_energy_trafo", Identity())
+        sc_trafo = config_dataset.get("samples_coordinate_trafo", Identity())
+        c_trafo = config_dataset.get("cond_trafo", Identity())
+        st_trafo = config_dataset.get("samples_time_trafo", None)
+
+        # Fit / load trafos from a small sample
+        _init_trafos_from_sample(
+            path, se_trafo, sc_trafo, c_trafo, st_trafo,
+            max_num_points, trafos_file,
+            rank, world_size, local_rank,
+        )
+
+        # Build label map once (reads only the pdg column)
+        label_map = _build_label_map(path, data_len)
+
+        start = rank * (split // world_size)
+        stop = (rank + 1) * (split // world_size)
+
+        data_train = LazyH5DataSet(
+            path, start, stop,
+            label_map=label_map,
+            samples_energy_trafo=se_trafo,
+            samples_coordinate_trafo=sc_trafo,
+            cond_trafo=c_trafo,
+            samples_time_trafo=st_trafo,
+            return_noise=return_noise,
+            return_direction=return_direction,
+            max_num_points=max_num_points,
+            num_layers=num_layers,
+        )
+        loader_train = DataLoader(
+            data_set=data_train,
+            batch_size=batch_size,
+            drop_last=(stop - start) > batch_size,
+            shuffle=True,
+        )
+
+        if rank == 0:
+            data_test = LazyH5DataSet(
+                path, split, data_len,
+                label_map=label_map,
+                samples_energy_trafo=se_trafo,
+                samples_coordinate_trafo=sc_trafo,
+                cond_trafo=c_trafo,
+                samples_time_trafo=st_trafo,
+                return_noise=return_noise,
+                return_direction=return_direction,
+                max_num_points=max_num_points,
+                num_layers=num_layers,
+            )
+            loader_test = DataLoader(
+                data_set=data_test,
+                batch_size=batch_size,
+                drop_last=False,
+                shuffle=False,
+            )
+        else:
+            loader_test = DataLoader(
+                data_set=DictDataSet(
+                    ModelInputDict(
+                        x=torch.empty(0, 0, 0),
+                        cond=torch.empty(0, 0),
+                        num_points=torch.empty(0, 0, dtype=torch.int64),
+                        layer=torch.empty(0, 0, dtype=torch.int64),
+                        mask=torch.empty(0, 0, dtype=torch.bool),
+                        label=torch.empty(0, 0, dtype=torch.int64),
+                        noise=None,
+                    )
+                ),
+                batch_size=batch_size,
+                drop_last=False,
+                shuffle=False,
+            )
+
+        trafos = {
+            "samples_energy_trafo": copy.deepcopy(se_trafo),
+            "samples_coordinate_trafo": copy.deepcopy(sc_trafo),
+            "cond_trafo": copy.deepcopy(c_trafo),
+            **({
+                "samples_time_trafo": copy.deepcopy(st_trafo)
+            } if st_trafo is not None else {}),
+        }
+        return loader_train, loader_test, trafos
+
+    # --- Original in-memory path (unchanged) ---
     start = rank * (split // world_size)
     stop = (rank + 1) * (split // world_size)
     data_train = DictDataSet(

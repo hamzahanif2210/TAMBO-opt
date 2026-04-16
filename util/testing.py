@@ -12,8 +12,5 @@ import numpy as np
 with h5py.File('/n/holylfs05/LABS/arguelles_delgado_lab/Everyone/hhanif/tambo_simulations_for_training/combined_photons_balanced.h5', "r") as f:
     pc = f["target/point_clouds"][:10]   # array of variable-length flat float32
     npts = f["target/num_points"][:10]   # int32, real hits per shower
-    F = f["target"].attrs["num_features"]
     print(pc)
-
-# Unpack vlen -> list of (num_points, F) arrays
-showers = [pc[i].reshape(npts[i], F) for i in range(len(pc))]
+    print(npts)

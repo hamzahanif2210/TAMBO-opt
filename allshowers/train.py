@@ -1,5 +1,6 @@
 import argparse
 import datetime
+import math
 import os
 import signal
 import socket
@@ -92,6 +93,12 @@ class Trainer:
         self.grad_accum = conf["train"].get("grad_accum", 1)
         self.result_path = conf["result_path"]
         self.batch_size = (self.batch_size + self.world_size - 1) // self.world_size
+        if self.device.type == "cuda":
+            max_cuda_batch = int(conf["train"].get("max_cuda_batch_size", 64))
+            if max_cuda_batch > 0 and self.batch_size > max_cuda_batch:
+                scale = math.ceil(self.batch_size / max_cuda_batch)
+                self.batch_size = math.ceil(self.batch_size / scale)
+                self.grad_accum *= scale
 
         self.checkpoint_file = self.get_path("checkpoints/last.pt")
         self.best_file = self.get_path("weights/best.pt")
@@ -147,8 +154,9 @@ class Trainer:
             flow_config = model_config.pop("flow_config")
         else:
             flow_config = {}
+        compile_model = bool(model_config.pop("compile", False))
         network = transformer.Transformer(**model_config)
-        if self.device.type == "cuda":
+        if self.device.type == "cuda" and compile_model:
             network = torch.compile(network)
         flow = flow_matching.CNF(network, **flow_config)  # type: ignore
         flow = flow.to(self.device)

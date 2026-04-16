@@ -22,12 +22,16 @@ python /n/home04/hhanif/AllShowers/allshowers/generator.py \
 '''
 
 import argparse
+import gc
 import os
 import platform
 import sys
 import time
 import warnings
 from typing import Any
+
+# Add parent directory to path so 'allshowers' package is importable
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import showerdata
 import torch
@@ -229,8 +233,9 @@ def generate(
     ):
         print_time(f"start batch {i:3d}")
         batch = [e.to(device) if e is not None else None for e in batch]
-        samples_l = generator(*batch).cpu()
+        samples_l = generator(*batch).detach().cpu()
         samples.append(samples_l)
+        
     samples = torch.cat(samples)
     print_time("generation done")
     return samples
