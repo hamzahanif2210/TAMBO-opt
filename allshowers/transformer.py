@@ -130,6 +130,9 @@ class FlexEncoderLayer(nn.Module):
 
 
 class Transformer(nn.Module):
+    # Normalisation constant for z-depth (metres) → ~[0, 1]
+    Z_MAX = 12000.0
+
     def __init__(
         self,
         dim_inputs: tuple[int, ...],
@@ -148,8 +151,6 @@ class Transformer(nn.Module):
         super().__init__()
         self.num_layer_cond = num_layer_cond
         self.embedding = nn.Linear(dim_inputs[0], dim_embedding)
-        self.layer_embedding = nn.Embedding(num_layers, dim_embedding)
-        self.cond_embedding = nn.Linear(sum(dim_inputs[1:]), dim_embedding)
         activation_classes = {
             "relu": nn.ReLU,
             "gelu": nn.GELU,
@@ -160,6 +161,15 @@ class Transformer(nn.Module):
         else:
             activation_module = activation
         del activation
+
+        # Continuous z-depth positional encoding (replaces discrete nn.Embedding)
+        self.z_embedding = nn.Sequential(
+            nn.Linear(1, dim_embedding),
+            activation_module,
+            nn.Linear(dim_embedding, dim_embedding),
+        )
+
+        self.cond_embedding = nn.Linear(sum(dim_inputs[1:]), dim_embedding)
         if num_points_cond > 0:
             self.num_points_embedding = nn.Sequential(
                 nn.Linear(num_layers, num_points_cond),
@@ -203,12 +213,14 @@ class Transformer(nn.Module):
         x: Tensor,
         cond: Tensor,
         num_points: Tensor,
-        layer: Tensor,
+        z_depth: Tensor,
         block_mask: BlockMask,
         label: Tensor | None = None,
     ) -> Tensor:
         x = self.embedding(x)
-        x += self.layer_embedding(layer.squeeze())
+        # Continuous z positional encoding: normalise to ~[0, 1] then embed
+        z_norm = z_depth.float() / self.Z_MAX  # [batch, points, 1]
+        x += self.z_embedding(z_norm)
         cond = torch.cat([t, cond], dim=1)
         cond = self.cond_embedding(cond).unsqueeze(1)
         x += cond

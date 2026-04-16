@@ -36,7 +36,7 @@ from torch import Tensor, nn
 
 from allshowers import flow_matching as fm
 from allshowers import transformer
-from allshowers.data_sets import to_label_tensor
+from allshowers.data_sets import Z_DEPTH_STEP, to_label_tensor
 from allshowers.preprocessing import compose
 
 start = time.perf_counter()
@@ -136,13 +136,33 @@ class Generator(nn.Module):
         num_points: Tensor,
         angles: Tensor,
         label: Tensor | None = None,
+        z_positions: Tensor | None = None,
     ) -> Tensor:
+        """Generate shower samples.
+
+        Args:
+            energies: [batch, 1] incident energies.
+            num_points: [batch, N_z] number of points at each z position.
+            angles: [batch, D] incident directions.
+            label: [batch] particle type indices (optional).
+            z_positions: [N_z] z-depth in metres for each bin (optional).
+                Defaults to the standard 24-plane layout (500, 1000, …, 12000).
+                Pass custom values to generate at arbitrary z positions,
+                e.g. torch.tensor([500, 800, 1000]) with a matching
+                num_points of shape [batch, 3].
+        """
         if self.expects_angles:
             condition = torch.concatenate(
                 [self.cond_trafo(energies * self.resize_factor), angles], dim=-1
             )
         else:
             condition = self.cond_trafo(energies)
+
+        n_z_bins = num_points.shape[1]
+
+        # Default z positions: standard plane layout
+        if z_positions is None:
+            z_positions = torch.arange(1, n_z_bins + 1, dtype=torch.float32) * Z_DEPTH_STEP
 
         layer = torch.zeros((condition.shape[0], self.max_points, 1), dtype=torch.int32)
         mask = torch.zeros((condition.shape[0], self.max_points, 1), dtype=torch.bool)
@@ -160,6 +180,16 @@ class Generator(nn.Module):
         layer = layer.to(condition.device)
         mask = mask.to(condition.device)
 
+        # Build per-point z_depth from layer assignments and z_positions
+        z_positions = z_positions.to(condition.device)
+        z_depth = torch.zeros(
+            (condition.shape[0], self.max_points, 1),
+            dtype=torch.float32,
+            device=condition.device,
+        )
+        for i in range(condition.shape[0]):
+            z_depth[i, :, 0] = z_positions[layer[i, :, 0].long()]
+
         if self.with_z and self.with_time:
             # 5 features: x, y, z_depth, e, t
             raw_samples = self.flow.sample(
@@ -168,10 +198,10 @@ class Generator(nn.Module):
                 cond=condition,
                 num_points=num_points,
                 layer=layer,
+                z_depth=z_depth,
                 mask=mask,
                 label=label,
             )
-            # Reconstruct 5-column output: x, y, z_depth, e, t
             samples = torch.zeros(
                 (condition.shape[0], self.max_points, 5), device=raw_samples.device
             )
@@ -188,10 +218,10 @@ class Generator(nn.Module):
                 cond=condition,
                 num_points=num_points,
                 layer=layer,
+                z_depth=z_depth,
                 mask=mask,
                 label=label,
             )
-            # Reconstruct 4-column output: x, y, z_depth, e
             samples = torch.zeros(
                 (condition.shape[0], self.max_points, 4), device=raw_samples.device
             )
@@ -200,42 +230,42 @@ class Generator(nn.Module):
             samples[:, :, 3]  = self.samples_energy_trafo.inverse(raw_samples[:, :, 3])
             samples[~mask.repeat(1, 1, 4)] = 0
         elif self.with_time:
-            # 4 features: x, y, e, t  (legacy: no continuous z)
+            # 4 features: x, y, e, t (legacy: no continuous z)
             raw_samples = self.flow.sample(
                 shape=(condition.shape[0], self.max_points, 4),
                 num_timesteps=self.num_timesteps,
                 cond=condition,
                 num_points=num_points,
                 layer=layer,
+                z_depth=z_depth,
                 mask=mask,
                 label=label,
             )
-            # Reconstruct 5-column output: x, y, z(layer), e, t
             samples = torch.zeros(
                 (condition.shape[0], self.max_points, 5), device=raw_samples.device
             )
             samples[:, :, :2] = self.samples_coordinate_trafo.inverse(raw_samples[:, :, :2])
-            samples[:, :, 2]  = layer.squeeze(2)
+            samples[:, :, 2]  = z_depth.squeeze(2)
             samples[:, :, 3]  = self.samples_energy_trafo.inverse(raw_samples[:, :, 2])
             samples[:, :, 4]  = self.samples_time_trafo.inverse(raw_samples[:, :, 3])
             samples[~mask.repeat(1, 1, 5)] = 0
         else:
-            # 3 features: x, y, e  (legacy: no continuous z)
+            # 3 features: x, y, e (legacy: no continuous z)
             raw_samples = self.flow.sample(
                 shape=(condition.shape[0], self.max_points, 3),
                 num_timesteps=self.num_timesteps,
                 cond=condition,
                 num_points=num_points,
                 layer=layer,
+                z_depth=z_depth,
                 mask=mask,
                 label=label,
             )
-            # Reconstruct 4-column output: x, y, z(layer), e
             samples = torch.zeros(
                 (condition.shape[0], self.max_points, 4), device=raw_samples.device
             )
             samples[:, :, :2] = self.samples_coordinate_trafo.inverse(raw_samples[:, :, :2])
-            samples[:, :, 2]  = layer.squeeze(2)
+            samples[:, :, 2]  = z_depth.squeeze(2)
             samples[:, :, 3]  = self.samples_energy_trafo.inverse(raw_samples[:, :, 2])
             samples[~mask.repeat(1, 1, 4)] = 0
 
@@ -256,6 +286,7 @@ def generate(
     batch_size: int | None = None,
     device: str | torch.device = "cpu",
     labels: Tensor | None = None,
+    z_positions: Tensor | None = None,
 ) -> Tensor:
     if batch_size is None:
         batch_size = energies.shape[0]
@@ -275,7 +306,7 @@ def generate(
     ):
         print_time(f"start batch {i:3d}")
         batch = [e.to(device) if e is not None else None for e in batch]
-        samples_l = generator(*batch).cpu()
+        samples_l = generator(*batch, z_positions=z_positions).cpu()
         samples.append(samples_l)
     samples = torch.cat(samples)
     print_time("generation done")

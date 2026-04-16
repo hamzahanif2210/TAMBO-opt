@@ -12,6 +12,7 @@ class ModelInputDict(TypedDict):
     cond: torch.Tensor
     num_points: torch.Tensor
     layer: torch.Tensor
+    z_depth: torch.Tensor  # continuous z position in metres (per point)
     mask: torch.Tensor
     label: torch.Tensor
     noise: torch.Tensor | None

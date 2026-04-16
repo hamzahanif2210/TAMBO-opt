@@ -309,6 +309,7 @@ def load_and_prepare(
         cond=cond,
         num_points=num_points,
         layer=layer,
+        z_depth=z_depth,  # continuous z position per point (metres)
         mask=mask,
         label=label if label is not None else torch.zeros(0, dtype=torch.int64),
         noise=data["noise"],
@@ -402,6 +403,7 @@ def get_data_loaders(
                     cond=torch.empty(0, 0),
                     num_points=torch.empty(0, 0, dtype=torch.int64),
                     layer=torch.empty(0, 0, dtype=torch.int64),
+                    z_depth=torch.empty(0, 0, 0),
                     mask=torch.empty(0, 0, dtype=torch.bool),
                     label=torch.empty(0, 0, dtype=torch.int64),
                     noise=None,

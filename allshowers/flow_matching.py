@@ -61,6 +61,8 @@ class CNF(nn.Module):
             layer=kwargs["layer"],
             num_layer_cond=self.num_layer_cond,
         )
+        # layer was only needed for mask computation; transformer uses z_depth
+        del kwargs["layer"]
 
     def encode(self, x: Tensor, num_timesteps: int = 200, **kwargs) -> Tensor:
         self.__calculate_block_mask(kwargs)
