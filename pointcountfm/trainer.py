@@ -51,19 +51,22 @@ class Trainer:
         self.train_losses_distill = []
         self.val_losses_distill = []
 
-        self.loss_log = self.__get_file_path("losses.csv")
-        self.loss_plot = self.__get_file_path("losses.pdf")
-        self.model_path = self.__get_file_path("model.pt")
-        self.checkpoint_path = self.__get_file_path("checkpoint.pt")
-        self.new_samples_path = self.__get_file_path("new_samples.h5")
-        self.compiled_path = self.__get_file_path("compiled.pt")
+        self.loss_log = self.__get_file_path("data/losses.txt")
+        self.loss_plot = self.__get_file_path("plots/losses.pdf")
+        self.model_path = self.__get_file_path("weights/model.pt")
+        self.checkpoint_path = self.__get_file_path("weights/checkpoint.pt")
+        self.checkpoint_last_path = self.__get_file_path("weights/last.pt")
+        self.checkpoint_best_path = self.__get_file_path("weights/best.pt")
+        self.new_samples_path = self.__get_file_path("data/new_samples.h5")
+        self.compiled_path = self.__get_file_path("weights/compiled.pt")
+        self.trafos_path = self.__get_file_path("preprocessing/trafos.pt")
 
-        self.loss_log_distill = self.__get_file_path("losses_distill.csv")
-        self.loss_plot_distill = self.__get_file_path("losses_distill.pdf")
-        self.model_path_distill = self.__get_file_path("model_distill.pt")
-        self.checkpoint_path_distill = self.__get_file_path("checkpoint_distill.pt")
+        self.loss_log_distill = self.__get_file_path("data/losses_distill.txt")
+        self.loss_plot_distill = self.__get_file_path("plots/losses_distill.pdf")
+        self.model_path_distill = self.__get_file_path("weights/model_distill.pt")
+        self.checkpoint_path_distill = self.__get_file_path("weights/checkpoint_distill.pt")
         self.new_samples_path_distilled = self.__get_file_path(
-            "new_samples_distilled.h5"
+            "data/new_samples_distilled.h5"
         )
 
         if os.path.exists(self.checkpoint_path):
@@ -103,6 +106,7 @@ class Trainer:
             )
             example_inputs[:, -1] = 1.0
         self.example_inputs = example_inputs
+        self.__save_trafos()
 
         print("Trainer initialized.")
         print(f"Device: {self.device}")
@@ -119,6 +123,24 @@ class Trainer:
         config = config.copy()
         if "name" not in config:
             raise ValueError("Model configuration missing.")
+        if "dim_input" in config and config["dim_input"] != self.dim_data:
+            warnings.warn(
+                (
+                    f'Overriding model dim_input from {config["dim_input"]} '
+                    f"to loader dim_data={self.dim_data}."
+                ),
+                UserWarning,
+            )
+        if "dim_condition" in config and config["dim_condition"] != self.dim_condition:
+            warnings.warn(
+                (
+                    f'Overriding model dim_condition from {config["dim_condition"]} '
+                    f"to loader dim_condition={self.dim_condition}."
+                ),
+                UserWarning,
+            )
+        config["dim_input"] = self.dim_data
+        config["dim_condition"] = self.dim_condition
         flow_config = config.pop("flow") if "flow" in config else {}
         model_name = config.pop("name")
         model_class = getattr(models, model_name)
@@ -172,6 +194,18 @@ class Trainer:
         if self.scheduler is not None:
             checkpoint["scheduler"] = self.scheduler.state_dict()
         torch.save(checkpoint, self.checkpoint_path)
+        torch.save(checkpoint, self.checkpoint_last_path)
+        if len(self.val_losses) == 1 or self.val_losses[-1] <= min(self.val_losses[:-1]):
+            torch.save(checkpoint, self.checkpoint_best_path)
+
+    def __save_trafos(self) -> None:
+        torch.save(
+            {
+                "transform_inc": self.train_loader.transform_inc,
+                "transform_num_points": self.train_loader.transform_num_points,
+            },
+            self.trafos_path,
+        )
 
     def __save_checkpoint_distill(self) -> None:
         if self.model_distill is None or self.optimizer_distill is None:
@@ -491,6 +525,13 @@ class Trainer:
 
     @torch.inference_mode()
     def compile(self) -> None:
+        if os.path.exists(self.checkpoint_best_path):
+            best_checkpoint = torch.load(
+                self.checkpoint_best_path,
+                map_location=self.device,
+                weights_only=True,
+            )
+            self.model.load_state_dict(best_checkpoint["model"])
         self.model.eval()
         print("Compiling started.")
 
@@ -791,7 +832,7 @@ def main(args: list | None = None) -> None:
         torch.set_default_dtype(torch.float16)
         trainer.to(torch.float16)
         cond_test = trainer.get_val_condition(10)
-        trainer.new_samples_path = os.path.join(result_dir, "new_samples_fp16.h5")
+        trainer.new_samples_path = os.path.join(result_dir, "data/new_samples_fp16.h5")
         trainer.sample_and_save(cond_test, 1, verbose=True)
         if parsed_args.distill:
             trainer.sample_batch(cond_test, 1, verbose=True, distilled=True)
