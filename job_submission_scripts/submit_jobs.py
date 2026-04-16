@@ -2,30 +2,36 @@
 """
 Submit TAMBO air-shower simulation jobs to SLURM.
 
-Usage examples:
-  python submit_jobs.py --jobs 2 --sims-per-job 2 --pdg 11 --gamma 1.5
-  python submit_jobs.py --jobs 2615 --sims-per-job 40 --pdg 11 --gamma 1.5 --timeout 120 --submit-sleep 0.5 --job-limit 5000
-  python submit_jobs.py --jobs 5000 --sims-per-job 40 --pdg 211 --gamma 1.5 --timeout 120 --submit-sleep 0.5 --job-limit 5000
-  python submit_jobs.py --jobs 2500 --sims-per-job 2 --pdg 11 --gamma 1.5 --submit-sleep 0.5 --job-limit 5000 --time-limit 0-08:00
+python /n/home04/hhanif/TAMBO-opt/job_submission_scripts/submit_jobs.py \
+    --jobs 4 --sims-per-job 2 --pdg -211 --gamma 1.5 \
+    --postprocess --submit-sleep 0.3
 
-  # With post-processing (delegates to preprocess_showers.py after each sim):
-  python /n/home04/hhanif/tam/utils/submit_jobs.py --jobs 2 --sims-per-job 2 --pdg 11 --gamma 1.5 \
-      --postprocess \
-      --electrons-dx 10.0 --muons-dx 10.0 --photons-dx 10.0 \
-      --electrons-nmax 2000 --muons-nmax 28000 --photons-nmax 6000 \
-      --time-limit 0-04:00
 
-  python /n/home04/hhanif/tam/utils/submit_jobs.py --jobs 2 --sims-per-job 2 --pdg 111 --gamma 1.5 \
-      --postprocess \
-      --electrons-dx 10.0 --muons-dx 10.0 --photons-dx 10.0 \
-      --electrons-nmax 2000 --muons-nmax 28000 --photons-nmax 6000 \
-      --time-limit 0-04:00
+python /n/home04/hhanif/TAMBO-opt/job_submission_scripts/submit_jobs.py \
+    --jobs 3500 --sims-per-job 10 --pdg 211 --gamma 1.5 \
+    --postprocess --submit-sleep 0.3
 
-  python /n/home04/hhanif/tam/utils/submit_jobs.py --jobs 1000 --sims-per-job 50 --pdg -211 --gamma 1.5 \
-      --postprocess \
-      --electrons-dx 10.0 --muons-dx 10.0 --photons-dx 10.0 \
-      --electrons-nmax 2000 --muons-nmax 20000 --photons-nmax 6000 \
-      --time-limit 3-00:00 --submit-sleep 0.3
+python /n/home04/hhanif/TAMBO-opt/job_submission_scripts/submit_jobs.py \
+    --jobs 3500 --sims-per-job 10 --pdg -211 --gamma 1.5 \
+    --postprocess --submit-sleep 0.3
+
+
+python /n/home04/hhanif/TAMBO-opt/job_submission_scripts/submit_jobs.py \
+    --jobs 2200 --sims-per-job 10 --pdg 11 --gamma 1.5 \
+    --postprocess --submit-sleep 0.3
+
+python /n/home04/hhanif/TAMBO-opt/job_submission_scripts/submit_jobs.py \
+    --jobs 2200 --sims-per-job 10 --pdg -11 --gamma 1.5 \
+    --postprocess --submit-sleep 0.3
+
+python /n/home04/hhanif/TAMBO-opt/job_submission_scripts/submit_jobs.py \
+    --jobs 2200 --sims-per-job 10 --pdg 111 --gamma 1.5 \
+    --postprocess --submit-sleep 0.3
+
+Notes on preemption:
+  Jobs are submitted with --no-requeue so that if SLURM preempts a job
+  it is cancelled rather than re-run, preventing duplicate simulations.
+  A SIGTERM trap in the bash script logs the preemption clearly.
 """
 
 import argparse
@@ -48,13 +54,17 @@ E_MIN    = 1e5
 E_MAX    = 1e8
 NUM_BINS = 100
 
-BASE_OUTPUT_DIR  = "/n/holylfs05/LABS/arguelles_delgado_lab/Everyone/hhanif/tambo_simulations_for_training/"
+# BASE_OUTPUT_DIR  = "/n/holylfs05/LABS/arguelles_delgado_lab/Everyone/hhanif/tambo_simulations_for_training2/"
+BASE_OUTPUT_DIR  = "/n/netscratch/arguelles_delgado_lab/Everyone/hhanif/tambo_simulations_samples_for_training/"
 ARGS_DIR_DEFAULT = os.path.join(BASE_OUTPUT_DIR, "args_batches")
 LOGS_DIR_DEFAULT = os.path.join(BASE_OUTPUT_DIR, "logs")
 SCRIPT_OUT_BASE  = os.path.join(BASE_OUTPUT_DIR, "scripts")
 
 # Absolute path to the companion post-processing script
-PREPROCESS_SCRIPT = "/n/home04/hhanif/tam/job_submission_scripts/preprocess_showers.py"
+PREPROCESS_SCRIPT = "/n/home04/hhanif/TAMBO-opt/job_submission_scripts/preprocess_showers.py"
+
+# Default SLURM time limit for all jobs
+DEFAULT_TIME_LIMIT = "1-00:00"
 
 
 # =============================================================================
@@ -142,11 +152,9 @@ def write_args_file(path: Path, n_lines: int, pdg_id: int, gamma: float):
 # =============================================================================
 
 def render_bash_template(
-    log_dir, partition, time_limit, memory,
+    log_dir, partition, memory,
     timeout_minutes=None, pdg_log_dir=None,
     postprocess=False,
-    electrons_dx=10.0,   muons_dx=10.0,   photons_dx=10.0,
-    electrons_nmax=6016, muons_nmax=4096,  photons_nmax=8192,
 ):
     effective_log_dir = pdg_log_dir if pdg_log_dir is not None else log_dir
 
@@ -172,24 +180,17 @@ def render_bash_template(
             '        fi',
         ])
 
-    # ── post-processing block (calls preprocess_showers.py as a subprocess) ───
+    # ── post-processing block ─────────────────────────────────────────────────
     if postprocess:
         postprocess_block = f"""
         # ── Post-processing ──────────────────────────────────────────────────
         if [ $exit_code -eq 0 ]; then
-            # Extract --filename value and expand $SLURM_JOB_ID
             _pp_raw=$(echo "$line" | grep -oP '(?<=--filename )\\S+')
             sim_out_dir=$(eval echo "$_pp_raw")
             if [ -n "$sim_out_dir" ] && [ -f "$sim_out_dir/summary.yaml" ]; then
                 echo "  → Post-processing: $sim_out_dir"
                 python3 {PREPROCESS_SCRIPT} \\
-                    --sim-dir        "$sim_out_dir" \\
-                    --electrons-dx   {electrons_dx} \\
-                    --muons-dx       {muons_dx} \\
-                    --photons-dx     {photons_dx} \\
-                    --electrons-nmax {electrons_nmax} \\
-                    --muons-nmax     {muons_nmax} \\
-                    --photons-nmax   {photons_nmax}
+                    --sim-dir "$sim_out_dir"
             else
                 echo "  → No summary.yaml found in $sim_out_dir, skipping post-processing."
             fi
@@ -202,16 +203,28 @@ def render_bash_template(
     return f"""#!/bin/bash
 #SBATCH --job-name=tambo_simulation
 #SBATCH --mem={memory}
-#SBATCH --time={time_limit}
+#SBATCH --time={DEFAULT_TIME_LIMIT}
 #SBATCH --output={effective_log_dir}/%j.out
 #SBATCH --error={effective_log_dir}/%j.err
 #SBATCH -p {partition}
+#SBATCH --no-requeue
 
-set -u
+# ── Preemption / time-limit guard ────────────────────────────────────────────
+# SLURM sends SIGTERM before killing a job (preemption or time-limit reached).
+# We catch it once, log the reason clearly, and exit with code 143 so the
+# .out log is unambiguous.  --no-requeue above ensures the job is not
+# restarted elsewhere after preemption, preventing duplicate simulations.
+#
+# NOTE: only ONE trap is set for TERM — a second trap would silently
+# overwrite the first, defeating the preemption guard entirely.
+trap 'echo "[SLURM] SIGTERM received at $(date) — job preempted or time-limit reached. Exiting (no requeue)."; exit 143' TERM
+
+# Catch Ctrl-C / interactive kills separately
+trap 'echo "[SLURM] SIGINT received at $(date). sim_count=${{sim_count}}. Exiting."; exit 1' INT
+
+set -u   # treat unset variables as errors (set AFTER traps so trap vars are safe)
 
 sim_count=0
-trap 'echo "[SLURM] Received SIGTERM/SIGINT at $(date). sim_count=${{sim_count}}. Exiting."; exit 1' TERM INT
-
 total_start=$(date +%s)
 
 cd /n/holylfs05/LABS/arguelles_delgado_lab/Everyone/hhanif/
@@ -270,19 +283,15 @@ echo "==========================================="
 
 
 def write_bash_script(
-    script_path: Path, partition, time_limit, memory,
+    script_path: Path, partition, memory,
     timeout_minutes=None, pdg_log_dir=None,
     postprocess=False,
-    electrons_dx=10.0,   muons_dx=10.0,   photons_dx=10.0,
-    electrons_nmax=6016, muons_nmax=4096,  photons_nmax=8192,
 ):
     script_path.parent.mkdir(parents=True, exist_ok=True)
     content = render_bash_template(
-        LOGS_DIR_DEFAULT, partition, time_limit, memory,
+        LOGS_DIR_DEFAULT, partition, memory,
         timeout_minutes=timeout_minutes, pdg_log_dir=pdg_log_dir,
         postprocess=postprocess,
-        electrons_dx=electrons_dx,     muons_dx=muons_dx,     photons_dx=photons_dx,
-        electrons_nmax=electrons_nmax, muons_nmax=muons_nmax,  photons_nmax=photons_nmax,
     )
     with open(script_path, "w") as f:
         f.write(content)
@@ -319,51 +328,48 @@ def submit_job(script_path: Path, args_file: Path, extra_sbatch=None, dry_run=Fa
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Submit TAMBO air-shower simulations to SLURM."
+        description="Submit TAMBO air-shower simulations to SLURM.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    parser.add_argument("--pdg", type=int, required=True, choices=[211, -211, 111, 11, -11])
-    parser.add_argument("--partition", "-p", default="shared,sapphire")
-    parser.add_argument("--mem",             default="8G")
-    parser.add_argument("--time-limit",      default="1-00:00")
-    parser.add_argument("--jobs",            type=int,   default=1)
-    parser.add_argument("--sims-per-job",    type=int,   default=10)
-    parser.add_argument("--args-dir",        default=ARGS_DIR_DEFAULT)
-    parser.add_argument("--script-out",      default=None)
-    parser.add_argument("--seed",            type=int,   default=None)
-    parser.add_argument("--sbatch-flags",    nargs=argparse.REMAINDER)
-    parser.add_argument("--dry-run",         action="store_true")
-    parser.add_argument("--timeout",         type=int,   default=None, metavar="MINUTES")
-    parser.add_argument("--submit-sleep",    type=float, default=0.5)
-    parser.add_argument("--job-limit",       type=int,   default=10000)
-    parser.add_argument("--gamma",           type=float, default=1.0)
+    parser.add_argument("--pdg",          type=int,   required=True, choices=[211, -211, 111, 11, -11])
+    parser.add_argument("--partition","-p",            default="serial_requeue")
+    parser.add_argument("--mem",                       default="8G")
+    parser.add_argument("--jobs",         type=int,   default=1)
+    parser.add_argument("--sims-per-job", type=int,   default=10)
+    parser.add_argument("--args-dir",                  default=ARGS_DIR_DEFAULT)
+    parser.add_argument("--script-out",                default=None)
+    parser.add_argument("--seed",         type=int,   default=None)
+    parser.add_argument("--sbatch-flags", nargs=argparse.REMAINDER)
+    parser.add_argument("--dry-run",      action="store_true")
+    parser.add_argument("--timeout",      type=int,   default=None, metavar="MINUTES",
+                        help="Per-simulation timeout in minutes (wraps each sim in `timeout Nm`).")
+    parser.add_argument("--submit-sleep", type=float, default=0.5)
+    parser.add_argument("--job-limit",    type=int,   default=10000)
+    parser.add_argument("--gamma",        type=float, default=1.0)
 
     pp = parser.add_argument_group("Post-processing")
-    pp.add_argument("--postprocess",     action="store_true")
-    pp.add_argument("--electrons-dx",    type=float, default=10.0,  metavar="M")
-    pp.add_argument("--muons-dx",        type=float, default=10.0,  metavar="M")
-    pp.add_argument("--photons-dx",      type=float, default=10.0,  metavar="M")
-    pp.add_argument("--electrons-nmax",  type=int,   default=6016,  metavar="N")
-    pp.add_argument("--muons-nmax",      type=int,   default=4096,  metavar="N")
-    pp.add_argument("--photons-nmax",    type=int,   default=8192,  metavar="N")
+    pp.add_argument("--postprocess", action="store_true",
+                    help="Run preprocess_showers.py after each simulation.")
 
     args = parser.parse_args()
 
     if args.seed is not None:
         random.seed(args.seed)
 
-    ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
     script_path = (Path(args.script_out) if args.script_out
                    else Path(SCRIPT_OUT_BASE) / f"run_tambo_batch_pdg_{args.pdg}_{ts}.sh")
 
     logs_dir    = Path(LOGS_DIR_DEFAULT)
-    logs_dir.mkdir(parents=True, exist_ok=True)
     pdg_log_dir = logs_dir / f"pdg_{args.pdg}"
-    if not pdg_log_dir.exists():
-        pdg_log_dir.mkdir(parents=True)
-        print(f"Created log subdirectory -> {pdg_log_dir}")
-    else:
-        print(f"Using existing log subdirectory -> {pdg_log_dir}")
+
+    # All dirs must exist before sbatch runs — SLURM will not create them.
+    for d in [logs_dir, pdg_log_dir, Path(SCRIPT_OUT_BASE), Path(ARGS_DIR_DEFAULT)]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    print(f"Log directory -> {pdg_log_dir}")
 
     try:
         flag_used = get_pdg_flags(args.pdg)
@@ -375,24 +381,20 @@ def main():
         print(f"Error: --gamma must be positive (got {args.gamma})"); sys.exit(1)
 
     timeout_str = f"{args.timeout}m" if args.timeout else "none"
-    print(f"Config: Partition={args.partition}, Time={args.time_limit}, "
-          f"Mem={args.mem}, Timeout={timeout_str}, Gamma={args.gamma}")
+    print(
+        f"Config    : partition={args.partition}  mem={args.mem}  "
+        f"time={DEFAULT_TIME_LIMIT}  timeout={timeout_str}  gamma={args.gamma}"
+    )
+    print("Preemption: --no-requeue + SIGTERM trap (cancelled on preemption, not restarted)")
 
     if args.postprocess:
-        print(
-            f"Post-processing: ENABLED  (via {PREPROCESS_SCRIPT})\n"
-            f"  electrons  dx={args.electrons_dx}m  nmax={args.electrons_nmax}\n"
-            f"  muons      dx={args.muons_dx}m  nmax={args.muons_nmax}\n"
-            f"  photons    dx={args.photons_dx}m  nmax={args.photons_nmax}"
-        )
+        print(f"Postprocess: ENABLED  ({PREPROCESS_SCRIPT})")
 
     write_bash_script(
         script_path,
-        partition=args.partition, time_limit=args.time_limit, memory=args.mem,
+        partition=args.partition, memory=args.mem,
         timeout_minutes=args.timeout, pdg_log_dir=pdg_log_dir,
         postprocess=args.postprocess,
-        electrons_dx=args.electrons_dx,     muons_dx=args.muons_dx,     photons_dx=args.photons_dx,
-        electrons_nmax=args.electrons_nmax, muons_nmax=args.muons_nmax, photons_nmax=args.photons_nmax,
     )
     print(f"Wrote SBATCH script -> {script_path}")
 
