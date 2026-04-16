@@ -60,19 +60,22 @@ class Trainer:
         self.train_losses_distill: list[float] = []
         self.val_losses_distill: list[float] = []
 
-        self.loss_log = self.__get_file_path("losses.csv")
-        self.loss_plot = self.__get_file_path("losses.pdf")
-        self.model_path = self.__get_file_path("model.pt")
-        self.checkpoint_path = self.__get_file_path("checkpoint.pt")
-        self.new_samples_path = self.__get_file_path("new_samples.h5")
-        self.compiled_path = self.__get_file_path("compiled.pt")
+        self.loss_log = self.__get_file_path("data/losses.txt")
+        self.loss_plot = self.__get_file_path("plots/losses.pdf")
+        self.model_path = self.__get_file_path("weights/model.pt")
+        self.checkpoint_path = self.__get_file_path("weights/checkpoint.pt")
+        self.checkpoint_last_path = self.__get_file_path("weights/last.pt")
+        self.checkpoint_best_path = self.__get_file_path("weights/best.pt")
+        self.new_samples_path = self.__get_file_path("data/new_samples.h5")
+        self.compiled_path = self.__get_file_path("weights/compiled.pt")
+        self.trafos_path = self.__get_file_path("preprocessing/trafos.pt")
 
-        self.loss_log_distill = self.__get_file_path("losses_distill.csv")
-        self.loss_plot_distill = self.__get_file_path("losses_distill.pdf")
-        self.model_path_distill = self.__get_file_path("model_distill.pt")
-        self.checkpoint_path_distill = self.__get_file_path("checkpoint_distill.pt")
+        self.loss_log_distill = self.__get_file_path("data/losses_distill.txt")
+        self.loss_plot_distill = self.__get_file_path("plots/losses_distill.pdf")
+        self.model_path_distill = self.__get_file_path("weights/model_distill.pt")
+        self.checkpoint_path_distill = self.__get_file_path("weights/checkpoint_distill.pt")
         self.new_samples_path_distilled = self.__get_file_path(
-            "new_samples_distilled.h5"
+            "data/new_samples_distilled.h5"
         )
 
         if os.path.exists(self.checkpoint_path):
@@ -92,6 +95,7 @@ class Trainer:
         self.example_inputs = torch.zeros(
             1, self.dim_condition, dtype=torch.float32
         )
+        self.__save_trafos()
 
         print("Reconstruction Trainer initialized.")
         print(f"Device: {self.device}")
@@ -163,6 +167,18 @@ class Trainer:
         if self.scheduler is not None:
             checkpoint["scheduler"] = self.scheduler.state_dict()
         torch.save(checkpoint, self.checkpoint_path)
+        torch.save(checkpoint, self.checkpoint_last_path)
+        if len(self.val_losses) == 1 or self.val_losses[-1] <= min(self.val_losses[:-1]):
+            torch.save(checkpoint, self.checkpoint_best_path)
+
+    def __save_trafos(self) -> None:
+        torch.save(
+            {
+                "transform_data": self.train_loader.transform_data,
+                "transform_condition": self.train_loader.transform_condition,
+            },
+            self.trafos_path,
+        )
 
     def __save_checkpoint_distill(self) -> None:
         if self.model_distill is None or self.optimizer_distill is None:
@@ -430,6 +446,13 @@ class Trainer:
 
     @torch.inference_mode()
     def compile(self) -> None:
+        if os.path.exists(self.checkpoint_best_path):
+            best_checkpoint = torch.load(
+                self.checkpoint_best_path,
+                map_location=self.device,
+                weights_only=True,
+            )
+            self.model.load_state_dict(best_checkpoint["model"])
         self.model.eval()
         print("Compiling started.")
 
