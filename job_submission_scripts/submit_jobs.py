@@ -3,17 +3,17 @@
 Submit TAMBO air-shower simulation jobs to SLURM.
 
 python /n/home04/hhanif/TAMBO-opt/job_submission_scripts/submit_jobs.py \
-    --jobs 4 --sims-per-job 2 --pdg -211 --gamma 1.5 \
+    --jobs 6 --sims-per-job 2 --pdg -211 --gamma 1.5 \
     --postprocess --submit-sleep 0.3
 
 
 python /n/home04/hhanif/TAMBO-opt/job_submission_scripts/submit_jobs.py \
     --jobs 3500 --sims-per-job 10 --pdg 211 --gamma 1.5 \
-    --postprocess --submit-sleep 0.3
+    --postprocess --submit-sleep 0.1
 
 python /n/home04/hhanif/TAMBO-opt/job_submission_scripts/submit_jobs.py \
     --jobs 3500 --sims-per-job 10 --pdg -211 --gamma 1.5 \
-    --postprocess --submit-sleep 0.3
+    --postprocess --submit-sleep 0.1
 
 
 python /n/home04/hhanif/TAMBO-opt/job_submission_scripts/submit_jobs.py \
@@ -190,7 +190,8 @@ def render_bash_template(
             if [ -n "$sim_out_dir" ] && [ -f "$sim_out_dir/summary.yaml" ]; then
                 echo "  → Post-processing: $sim_out_dir"
                 python3 {PREPROCESS_SCRIPT} \\
-                    --sim-dir "$sim_out_dir"
+                    --sim-dir "$sim_out_dir" \\
+                    --base-output-dir "{BASE_OUTPUT_DIR}"
             else
                 echo "  → No summary.yaml found in $sim_out_dir, skipping post-processing."
             fi

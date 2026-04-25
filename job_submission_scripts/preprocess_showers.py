@@ -43,9 +43,9 @@ HIT_COLUMNS = [
     "x",
     "y",
     "z",
-    "nx",
-    "ny",
-    "nz",
+    # "nx",
+    # "ny",
+    # "nz",
     "pdg",
     "time",
     "kinetic_energy",
@@ -276,6 +276,86 @@ def _remove_all_raw_parquets(sim_dir: str, verbose: bool = True) -> tuple[int, i
 
 
 # =============================================================================
+# PDG registry helpers
+# =============================================================================
+
+# Maps every supported PDG value to its canonical registry filename.
+_PDG_REGISTRY_FILES = {
+    -11:  "registry_pdg_-11.txt",
+     11:  "registry_pdg_11.txt",
+    111:  "registry_pdg_111.txt",
+    211:  "registry_pdg_211.txt",
+   -211:  "registry_pdg_-211.txt",
+}
+
+
+def _get_registry_path(base_output_dir: str, incident_pdg: int) -> str | None:
+    """
+    Return the path to the per-PDG registry .txt file that lives in
+    BASE_OUTPUT_DIR.  Returns None if the PDG is not in the known set.
+    """
+    fname = _PDG_REGISTRY_FILES.get(incident_pdg)
+    if fname is None:
+        return None
+    return os.path.join(base_output_dir, fname)
+
+
+def _append_to_registry(registry_path: str, parquet_path: str) -> None:
+    """
+    Append *parquet_path* as a new line to the registry file, using an
+    exclusive fcntl lock so that parallel SLURM tasks writing to the same
+    file do not corrupt it.
+    """
+    import fcntl
+
+    os.makedirs(os.path.dirname(registry_path), exist_ok=True)
+    with open(registry_path, "a") as fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            fh.write(parquet_path + "\n")
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def _write_event_csv(csv_path: str, incident_meta: dict,
+                     incident_x: float, incident_y: float, incident_z: float,
+                     direction: "np.ndarray",
+                     z_depth_start: float, z_depth_step: float,
+                     shower_id: str, sim_dir: str) -> None:
+    """
+    Write a single-row CSV whose columns are exactly EVENT_COLUMNS.
+    This makes the event-level metadata available as a flat file alongside
+    the hit-level parquet (the parquet only stores these in its key-value
+    schema metadata, not as row columns).
+    """
+    import csv
+
+    row = {
+        "shower_id":         shower_id,
+        "incident_energy":   incident_meta["incident_energy"],
+        "incident_zenith":   incident_meta["incident_zenith"],
+        "incident_azimuth":  incident_meta["incident_azimuth"],
+        "incident_class_id": incident_meta["incident_class_id"],
+        "incident_x":        incident_x,
+        "incident_y":        incident_y,
+        "incident_z":        incident_z,
+        "direction_x":       float(direction[0]),
+        "direction_y":       float(direction[1]),
+        "direction_z":       float(direction[2]),
+        "incident_pdg":      incident_meta["incident_pdg"],
+        "z_depth_start":     z_depth_start,
+        "z_depth_step":      z_depth_step,
+        "created":           datetime.now().isoformat(),
+        "sim_dir":           sim_dir,
+    }
+
+    with open(csv_path, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=EVENT_COLUMNS)
+        writer.writeheader()
+        writer.writerow(row)
+
+
+# =============================================================================
 # Metadata readers
 # =============================================================================
 
@@ -456,6 +536,7 @@ def postprocess_simulation(
     z_depth_start: float = 500.0,
     z_depth_step: float  = 500.0,
     verbose: bool = True,
+    base_output_dir: str | None = None,
 ) -> dict:
     np, pd, yaml, pa, pq, pc = _lazy_imports()
 
@@ -466,6 +547,8 @@ def postprocess_simulation(
         "input_bytes_removed": 0,
         "hits_out_bytes":      0,
         "hits_out_file":       None,
+        "event_csv_file":      None,
+        "registry_file":       None,
     }
 
     shower_id = result["shower_id"]
@@ -622,10 +705,52 @@ def postprocess_simulation(
         existing   = hits_table.schema.metadata or {}
         hits_table = hits_table.replace_schema_metadata({**existing, **file_meta})
 
-        pq.write_table(hits_table, hits_out_path, compression="zstd")
+        pq.write_table(hits_table, hits_out_path, compression="zstd",compression_level=10)
 
         result["hits_out_file"]  = hits_out_path
         result["hits_out_bytes"] = os.path.getsize(hits_out_path)
+
+        # ------------------------------------------------------------------
+        # Write EVENT_COLUMNS as a single-row CSV next to the parquet.
+        # (The parquet stores these only in schema key-value metadata, not
+        #  as row-level columns, so the CSV makes them readily accessible.)
+        # ------------------------------------------------------------------
+        event_csv_path = hits_out_path.replace("_hits.parquet", "_event.csv")
+        try:
+            _write_event_csv(
+                csv_path       = event_csv_path,
+                incident_meta  = incident_meta,
+                incident_x     = incident_x,
+                incident_y     = incident_y,
+                incident_z     = incident_z,
+                direction      = direction,
+                z_depth_start  = z_depth_start,
+                z_depth_step   = z_depth_step,
+                shower_id      = shower_id,
+                sim_dir        = sim_dir,
+            )
+            result["event_csv_file"] = event_csv_path
+            if verbose:
+                print(f"  event CSV        : {os.path.basename(event_csv_path)}")
+        except Exception as e:
+            if verbose:
+                print(f"  WARNING: could not write event CSV: {e}")
+
+        # ------------------------------------------------------------------
+        # Append the parquet path to the per-PDG registry in BASE_OUTPUT_DIR.
+        # Uses fcntl locking so parallel SLURM tasks are safe.
+        # ------------------------------------------------------------------
+        if base_output_dir is not None:
+            registry_path = _get_registry_path(base_output_dir, incident_meta["incident_pdg"])
+            if registry_path is not None:
+                try:
+                    _append_to_registry(registry_path, hits_out_path)
+                    result["registry_file"] = registry_path
+                    if verbose:
+                        print(f"  registry         : {os.path.basename(registry_path)}")
+                except Exception as e:
+                    if verbose:
+                        print(f"  WARNING: could not update registry: {e}")
 
     except Exception as e:
         result["status"]  = "error"
@@ -685,6 +810,15 @@ def main():
         action="store_true",
         help="Suppress detailed logging",
     )
+    parser.add_argument(
+        "--base-output-dir",
+        default=None,
+        help=(
+            "Root output directory (same as BASE_OUTPUT_DIR in submit_jobs.py). "
+            "When provided, the path of the written parquet is appended to a "
+            "per-PDG registry file, e.g. registry_pdg_-11.txt, inside this dir."
+        ),
+    )
 
     args    = parser.parse_args()
     sim_dir = os.path.normpath(args.sim_dir)
@@ -705,10 +839,11 @@ def main():
     print()
 
     result = postprocess_simulation(
-        sim_dir       = sim_dir,
-        z_depth_start = args.z_depth_start,
-        z_depth_step  = args.z_depth_step,
-        verbose       = not args.quiet,
+        sim_dir         = sim_dir,
+        z_depth_start   = args.z_depth_start,
+        z_depth_step    = args.z_depth_step,
+        verbose         = not args.quiet,
+        base_output_dir = args.base_output_dir,
     )
 
     print(f"\nStatus      : {result['status']}")
@@ -718,6 +853,10 @@ def main():
 
     if result["hits_out_file"]:
         print(f"Hits file   : {result['hits_out_file']}")
+    if result["event_csv_file"]:
+        print(f"Event CSV   : {result['event_csv_file']}")
+    if result["registry_file"]:
+        print(f"Registry    : {result['registry_file']}")
     if result["message"]:
         print(f"Detail      : {result['message']}")
 

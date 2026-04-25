@@ -9,7 +9,7 @@ Creates a result directory for the reconstruction FM trainer, writes:
 
 Example:
 
-python mkresultdir_reconstruction.py conf/reconstruction.yaml \
+python /n/home04/hhanif/TAMBO-opt/mkresultdir_reconstruction.py /n/home04/hhanif/TAMBO-opt/conf/reconstruction.yaml \
   -p gpu_requeue -g 1 -n 1 --mem 10G --cpus-per-task 1 --time 2:00:00 -r
 """
 

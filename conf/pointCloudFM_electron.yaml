@@ -2,6 +2,7 @@ run_name: Electron-PointCountFM
 data:
   data_file: /n/holylfs05/LABS/arguelles_delgado_lab/Everyone/hhanif/tambo_simulations_for_training/combined_electrons_balanced_for_pointcloud.h5
   transform_num_points:
+    - [Dequantize]                    # smooths integers → floats
     - [Log, {alpha: 0.5}]
     - [StandardScaler, {shape: [1, 24]}]
   transform_inc:
@@ -14,7 +15,7 @@ model:
   name: FullyConnected
   dim_input: 24
   dim_condition: 6
-  dim_time: 12
+  dim_time: 6
   hidden_dims:
   - 128
   - 256
