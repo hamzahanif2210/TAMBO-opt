@@ -14,6 +14,7 @@ import yaml
 from matplotlib import pyplot as plt
 from rangerlite import RangerLite
 from torch import optim
+from util.optimizer import Lion
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_, get_total_norm
 
@@ -199,6 +200,13 @@ class Trainer:
                 weight_decay=self.weight_decay,
                 lookahead_steps=6,
                 lookahead_alpha=0.5,
+            )
+        elif optimizer_name == "lion":
+            self.optimizer = Lion(
+                params=self.flow.network.parameters(),
+                lr=self.learning_rate,
+                betas=(0.9, 0.99),
+                weight_decay=self.weight_decay,
             )
         elif optimizer_name == "muon":
             if not hasattr(optim, "Muon"):
