@@ -4,20 +4,20 @@ run_name: Photon-Allshower
 data:
   path: /n/holylfs05/LABS/arguelles_delgado_lab/Everyone/hhanif/tambo_simulations_for_training/h5_files/combined_photons.h5
   samples_energy_trafo:
-    - [Log, {alpha: 0.0}]
+    - [Log, {alpha: 1.0e-6}]
     - [StandardScaler, {shape: [1, 1]}]
   samples_coordinate_trafo:
     - [StandardScaler, {shape: [1, 1, 2]}]
   samples_time_trafo:
-    - [Log, {alpha: 0.0}]
+    - [Log, {alpha: 1.0e-6}]
     - [StandardScaler, {shape: [1, 1]}]
   cond_trafo:
-    - [Log, {alpha: 0.0}]
+    - [Log, {alpha: 1.0e-6}]
     - [StandardScaler, {shape: [1, 1]}]
   return_noise: True
   return_direction: True
   val_len: 30000
-  max_num_points: 2048
+  max_num_points: 4096
 
 
 model:
@@ -36,7 +36,8 @@ model:
 
 train:
   num_epochs: 200
-  batch_size: 1024
+  batch_size: 256
+  grad_accum: 4
   learning_rate: 1.e-3
   optimizer: Ranger
   scheduler: Cosine

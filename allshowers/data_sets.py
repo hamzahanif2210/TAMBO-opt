@@ -254,6 +254,8 @@ def load_and_prepare(
         x[~mask.repeat(1, 1, 3)] = 0.0
 
     layer = (data["shower"][:, :, [2]] + 0.1).long()
+    if num_layers > 0:
+        layer = layer.clamp(0, num_layers - 1)
     num_points = batched_histogram(
         data=layer.squeeze(dim=-1),
         mask=mask.squeeze(dim=-1),

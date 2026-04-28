@@ -358,8 +358,12 @@ class Trainer:
             if isinstance(batch[key], torch.Tensor):
                 batch[key] = batch[key].to(self.device)
         losses = self.flow.loss(**batch)
-        losses = losses * batch["mask"].to(losses.dtype)
-        losses = torch.mean(losses, dim=(1, 2))
+        mask = batch["mask"].to(losses.dtype)
+        losses = losses * mask
+        # Normalize by number of valid points so the loss scale is independent of
+        # max_num_points padding, preventing effective gradient shrinkage at 4096 vs 2048.
+        num_valid = mask.sum(dim=(1, 2)).clamp(min=1)
+        losses = losses.sum(dim=(1, 2)) / (num_valid * losses.shape[-1])
         return losses
 
     def fit(self) -> None:
