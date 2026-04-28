@@ -32,6 +32,9 @@ Usage:
   python combine_by_particle.py --particle electrons --train-limit 130000 --save-test-only
   python combine_by_particle.py --particle all
   python /n/home04/hhanif/TAMBO-opt/job_submission_scripts/combine_h5_files.py --particle electrons  --train-limit 130000 --save-test-also --slurm
+
+  python /n/home04/hhanif/TAMBO-opt/job_submission_scripts/combine_h5_files.py --particle photons  --train-limit 130000 --save-test-also --slurm
+
 """
 
 import os

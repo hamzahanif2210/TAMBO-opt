@@ -12,7 +12,11 @@ SLURM job per chunk. Each job produces 3 HDF5 files:
 
 Example:
 
-python /n/home04/hhanif/TAMBO-opt/job_submission_scripts/postprocess_showers_submission.py     --registry-dir /n/netscratch/arguelles_delgado_lab/Everyone/hhanif/tambo_simulations_samples_for_training/     --output-dir   /n/holylfs05/LABS/arguelles_delgado_lab/Everyone/hhanif/tambo_simulations_for_training/h5_files     --script       /n/home04/hhanif/TAMBO-opt/job_submission_scripts/postprocess_showers.py     --chunk-size   200     --partition    serial_requeue --time 4:00:00 --mem 8G --cpus 1 --particles electrons --electrons-nmax 2048 --electrons-dx 8
+#electron
+python /n/home04/hhanif/TAMBO-opt/job_submission_scripts/postprocess_showers_submission.py     --registry-dir /n/netscratch/arguelles_delgado_lab/Everyone/hhanif/tambo_simulations_samples_for_training/     --output-dir   /n/holylfs05/LABS/arguelles_delgado_lab/Everyone/hhanif/tambo_simulations_for_training/h5_files     --script       /n/home04/hhanif/TAMBO-opt/job_submission_scripts/postprocess_showers.py     --chunk-size   500     --partition    serial_requeue --time 4:00:00 --mem 16G --cpus 1 --particles electrons --electrons-nmax 4096 --electrons-dx 10
+
+#photon
+python /n/home04/hhanif/TAMBO-opt/job_submission_scripts/postprocess_showers_submission.py     --registry-dir /n/netscratch/arguelles_delgado_lab/Everyone/hhanif/tambo_simulations_samples_for_training/     --output-dir   /n/holylfs05/LABS/arguelles_delgado_lab/Everyone/hhanif/tambo_simulations_for_training/h5_files     --script       /n/home04/hhanif/TAMBO-opt/job_submission_scripts/postprocess_showers.py     --chunk-size   25     --partition    serial_requeue --time 4:00:00 --mem 16G --cpus 1 --particles photons --photons-nmax 4096 --photons-dx 8
 
 
 python /n/home04/hhanif/TAMBO-opt/job_submission_scripts/postprocess_showers_submission.py \
@@ -22,10 +26,10 @@ python /n/home04/hhanif/TAMBO-opt/job_submission_scripts/postprocess_showers_sub
     --time 4:00:00 \
     --mem 16G \
     --cpus 1 \
-    --particles electrons \
-    --electrons-nmax 2048 \
-    --electrons-dx 8 \
-    --resubmit /n/holylfs05/LABS/arguelles_delgado_lab/Everyone/hhanif/tambo_simulations_for_training/h5_files/_submit/run_20260424_142209/
+    --particles photons \
+    --photons-nmax 4096 \
+    --photons-dx 8 \
+    --resubmit /n/holylfs05/LABS/arguelles_delgado_lab/Everyone/hhanif/tambo_simulations_for_training/h5_files/_submit/run_20260426_183055/
 
 
     python submit_postprocess.py \\

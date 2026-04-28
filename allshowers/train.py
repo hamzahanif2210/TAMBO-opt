@@ -14,7 +14,7 @@ import yaml
 from matplotlib import pyplot as plt
 from rangerlite import RangerLite
 from torch import optim
-from util.optimizer import Lion
+from optimizer import Lion
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_, get_total_norm
 
